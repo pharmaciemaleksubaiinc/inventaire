@@ -32,6 +32,28 @@ except Exception:
 
 
 # -----------------------------
+# Prefix seed (Canada-typical)
+# Sources/examples:
+# - Ontario ODB interchangeable listings show Apo-, Auro-, Jamp-, Mint-, Mylan-, etc. :contentReference[oaicite:2]{index=2}
+# - CIHI notes examples NOVO, APO, PMS, RATIO, SANDOZ :contentReference[oaicite:3]{index=3}
+# This is NOT “everything in Canada”, so we ALSO learn prefixes from your file.
+# -----------------------------
+CANADA_PREFIX_SEED = {
+    "APO", "PMS", "RATIO", "SANDOZ", "NOVO",
+    "AURO", "JAMP", "MINT", "MYLAN",
+    "ACH", "ACC", "AG", "MAR", "NRA", "CO", "PRO", "TEVA", "TARO", "ACT",
+}
+
+# Vendors: removed from name, stored separately.
+DEFAULT_VENDORS = {
+    "MCKESSON",
+    "PHARMA PLUS",
+    "PHARMAPLUS",
+    "PHARMA+",
+}
+
+
+# -----------------------------
 # Utils
 # -----------------------------
 def normalise_space(s: str) -> str:
@@ -54,9 +76,6 @@ def to_float_or_none(x) -> Optional[float]:
         return None
 
 
-# -----------------------------
-# Read files
-# -----------------------------
 def read_pdf_to_dataframe(uploaded_file) -> pd.DataFrame:
     if not PDFPLUMBER_OK:
         raise RuntimeError("PDF support not installed. Add pdfplumber to requirements.txt.")
@@ -95,45 +114,32 @@ def read_uploaded_file(uploaded_file) -> Tuple[pd.DataFrame, str]:
 
 
 # -----------------------------
-# Auto-detect columns (robust)
+# Column detection
 # -----------------------------
-def detect_quantity_candidates(df: pd.DataFrame, sample_n: int = 600) -> List[Tuple[float, int]]:
-    """
-    Scores each column by how numeric it is.
-    Returns list of (score, idx) sorted desc.
-    """
+def detect_quantity_candidates(df: pd.DataFrame, sample_n: int = 800) -> List[Tuple[float, int]]:
     scored = []
     for i in range(df.shape[1]):
         col = df.iloc[:, i].dropna().head(sample_n)
         if len(col) == 0:
             scored.append((0.0, i))
             continue
-
-        numeric = [to_float_or_none(v) for v in col]
-        hits = sum(1 for v in numeric if v is not None)
-        score = hits / max(1, len(col))
-        scored.append((score, i))
-
+        hits = sum(1 for v in col if to_float_or_none(v) is not None)
+        scored.append((hits / max(1, len(col)), i))
     scored.sort(reverse=True)
     return scored
 
 
 def detect_text_columns(df: pd.DataFrame, qty_idx: int) -> List[int]:
-    """
-    Picks columns likely to be description columns (texty).
-    """
     candidates = []
     for i in range(df.shape[1]):
         if i == qty_idx:
             continue
-        sample = df.iloc[:, i].dropna().astype(str).head(350)
+        sample = df.iloc[:, i].dropna().astype(str).head(400)
         if len(sample) == 0:
             continue
         avg_len = sum(len(s.strip()) for s in sample) / max(1, len(sample))
-        # favour columns that are mostly non-numeric
         non_num = sum(1 for s in sample if to_float_or_none(s) is None) / max(1, len(sample))
         candidates.append((avg_len * non_num, i))
-
     candidates.sort(reverse=True)
     return [i for _, i in candidates[:6]]
 
@@ -152,16 +158,30 @@ def build_description(row: pd.Series, text_cols: List[int]) -> str:
 
 
 # -----------------------------
-# Prefix logic (safe + “combine regardless of prefix”)
+# Vendor extraction (remove from name, keep separate)
 # -----------------------------
-def learn_prefixes_from_hyphens(descriptions: pd.Series) -> Set[str]:
-    """
-    Learn prefixes ONLY from hyphenated forms found in the file:
-      AA-FLUOXETINE -> AA
-    This is safe and requires no “min count” slider.
-    """
+def extract_and_remove_vendors(text: str, vendors: Set[str]) -> Tuple[str, Set[str]]:
+    s = normalise_space(text)
+    found = set()
+    if not s:
+        return s, found
+
+    # remove longer phrases first
+    for v in sorted({normalise_space(x).upper() for x in vendors if normalise_space(x)}, key=len, reverse=True):
+        pattern = rf"(?i)\b{re.escape(v)}\b"
+        if re.search(pattern, s):
+            found.add(v)
+            s = re.sub(pattern, " ", s)
+
+    return normalise_space(s), found
+
+
+# -----------------------------
+# Prefix learning + stripping for grouping
+# -----------------------------
+def learn_hyphen_prefixes(desc_series: pd.Series) -> Set[str]:
     prefixes = set()
-    for raw in descriptions.dropna().astype(str).head(15000):
+    for raw in desc_series.dropna().astype(str).head(20000):
         s = normalise_space(raw)
         m = re.match(r"^([A-Za-z]{1,10})\s*-\s*(.+)$", s)
         if m:
@@ -171,18 +191,18 @@ def learn_prefixes_from_hyphens(descriptions: pd.Series) -> Set[str]:
     return prefixes
 
 
-def split_prefix_and_core(desc: str, hyphen_prefixes: Set[str]) -> Tuple[Optional[str], str]:
+def strip_prefix(desc: str, prefix_set: Set[str]) -> Tuple[Optional[str], str]:
     """
-    Combine meds regardless of prefix:
-      - If it's hyphen-prefix: strip always.
-      - If it's space-prefix: strip only if that token is known from hyphen-prefixes in THIS file.
-        (prevents stripping manufacturer names like ASTELLAS/BAUSCH/etc.)
+    Returns (prefix_found, core_name)
+    Strips:
+      - Hyphen prefixes always (AA-FLUOXETINE)
+      - Space prefixes if in prefix_set (PMS FLUOXETINE)
     """
     s = normalise_space(desc)
     if not s:
         return None, s
 
-    # Hyphen form: always strip
+    # Hyphen
     m = re.match(r"^([A-Za-z]{1,10})\s*-\s*(.+)$", s)
     if m:
         p = m.group(1).upper()
@@ -190,41 +210,61 @@ def split_prefix_and_core(desc: str, hyphen_prefixes: Set[str]) -> Tuple[Optiona
         if p.isalpha() and rest:
             return p, rest
 
-    # Space form: strip only if that prefix was seen in hyphen form somewhere in the file
+    # Space
     parts = s.split()
     if len(parts) >= 2:
         first = parts[0].upper()
-        if first in hyphen_prefixes:
+        if first in prefix_set:
             return first, normalise_space(" ".join(parts[1:]))
 
     return None, s
 
 
-def is_reasonable_name(core: str) -> bool:
+def extract_molecule(core: str) -> str:
     """
-    Avoid grouping junk rows like "0.4 mL" or "Plaquette".
-    Needs letters and at least 6 chars.
+    Groups by the molecule name (your request: venlafaxine, pregabalin, etc.)
+    Take the first “meaningful” token that contains letters.
+    Keeps combos like AMOXICILLIN/CLAVULANATE or A+B.
     """
+    s = normalise_space(core)
+    if not s:
+        return s
+
+    # Split and find first token with letters
+    for tok in s.split():
+        if re.search(r"[A-Za-zÀ-ÿ]", tok):
+            # clean punctuation edges
+            tok = tok.strip(" ,;()[]{}")
+            return tok.upper()
+    return s.upper()
+
+
+def is_reasonable_core(core: str) -> bool:
     c = normalise_space(core)
-    return bool(re.search(r"[A-Za-zÀ-ÿ]", c)) and len(c) >= 6
+    return bool(re.search(r"[A-Za-zÀ-ÿ]", c)) and len(c) >= 4
 
 
 # -----------------------------
 # Aggregation
 # -----------------------------
-def aggregate_inventory(df: pd.DataFrame, qty_idx: int) -> Tuple[pd.DataFrame, int, int, Set[str]]:
+def aggregate(df: pd.DataFrame, qty_idx: int, vendors: Set[str]) -> Tuple[pd.DataFrame, int, int, Set[str], Set[str]]:
     text_cols = detect_text_columns(df, qty_idx)
 
-    # Build descriptions to learn hyphen-prefixes from the actual file
-    descs = []
+    # Build descriptions (cleaned for vendor words) to learn prefixes safely
+    tmp_desc = []
     for _, row in df.iterrows():
         d = build_description(row, text_cols)
+        d, _ = extract_and_remove_vendors(d, vendors)
         if d:
-            descs.append(d)
-    hyphen_prefixes = learn_prefixes_from_hyphens(pd.Series(descs))
+            tmp_desc.append(d)
 
+    hyphen_prefixes = learn_hyphen_prefixes(pd.Series(tmp_desc))
+    prefix_set = set(CANADA_PREFIX_SEED) | hyphen_prefixes  # seed + learned
+
+    # Aggregate by molecule
     totals: Dict[str, float] = {}
-    brands: Dict[str, Set[str]] = {}
+    brand_prefixes: Dict[str, Set[str]] = {}
+    vendor_seen: Dict[str, Set[str]] = {}
 
     parsed = 0
     skipped = 0
@@ -236,32 +276,45 @@ def aggregate_inventory(df: pd.DataFrame, qty_idx: int) -> Tuple[pd.DataFrame, i
             continue
 
         desc = build_description(row, text_cols)
+        desc, vend = extract_and_remove_vendors(desc, vendors)
+
         if not desc:
             skipped += 1
             continue
 
-        prefix, core = split_prefix_and_core(desc, hyphen_prefixes)
+        pfx, core = strip_prefix(desc, prefix_set)
 
-        if not is_reasonable_name(core):
+        if not is_reasonable_core(core):
             skipped += 1
             continue
 
-        totals[core] = totals.get(core, 0.0) + float(qty)
-        if prefix:
-            brands.setdefault(core, set()).add(prefix)
+        molecule = extract_molecule(core)
+        if not molecule:
+            skipped += 1
+            continue
+
+        totals[molecule] = totals.get(molecule, 0.0) + float(qty)
+
+        if pfx:
+            brand_prefixes.setdefault(molecule, set()).add(pfx.upper())
+        if vend:
+            vendor_seen.setdefault(molecule, set()).update({v.upper() for v in vend})
 
         parsed += 1
 
     out = pd.DataFrame(
         {
-            "Médicament (regroupé)": list(totals.keys()),
+            "Molécule (regroupée)": list(totals.keys()),
             "Quantité totale": [totals[k] for k in totals.keys()],
-            "Préfixes / Marques trouvés": [", ".join(sorted(brands.get(k, set()))) for k in totals.keys()],
+            "Préfixes / Marques trouvés": [", ".join(sorted(brand_prefixes.get(k, set()))) for k in totals.keys()],
+            "Vendeurs trouvés": [", ".join(sorted(vendor_seen.get(k, set()))) for k in totals.keys()],
         }
-    ).sort_values("Médicament (regroupé)").reset_index(drop=True)
+    ).sort_values("Molécule (regroupée)").reset_index(drop=True)
 
     out["Préfixes / Marques trouvés"] = out["Préfixes / Marques trouvés"].fillna("")
-    return out, parsed, skipped, hyphen_prefixes
+    out["Vendeurs trouvés"] = out["Vendeurs trouvés"].fillna("")
+
+    return out, parsed, skipped, prefix_set, hyphen_prefixes
 
 
 # -----------------------------
@@ -285,17 +338,18 @@ def dataframe_to_simple_pdf(df: pd.DataFrame, title: str) -> bytes:
     c.setFont("Helvetica", 9)
     lh = 11
 
-    headers = ["Médicament (regroupé)", "Quantité totale", "Préfixes / Marques trouvés"]
-    c.drawString(x, y, f"{headers[0][:55]:55}  {headers[1]:>12}  {headers[2]}")
+    cols = ["Molécule (regroupée)", "Quantité totale", "Préfixes / Marques trouvés", "Vendeurs trouvés"]
+    c.drawString(x, y, f"{cols[0][:20]:20} {cols[1]:>12}  {cols[2][:25]:25}  {cols[3][:25]}")
     y -= lh
     c.drawString(x, y, "-" * 115)
     y -= lh
 
     for _, r in df.iterrows():
-        name = str(r[headers[0]])[:55]
-        qty = f"{float(r[headers[1]]):.2f}"
-        pref = str(r[headers[2]])[:45]
-        line = f"{name:55}  {qty:>12}  {pref}"
+        mol = str(r[cols[0]])[:20]
+        qty = f"{float(r[cols[1]]):.2f}"
+        pfx = str(r[cols[2]])[:25]
+        ven = str(r[cols[3]])[:25]
+        line = f"{mol:20} {qty:>12}  {pfx:25}  {ven}"
 
         if y < 0.75 * inch:
             c.showPage()
@@ -313,11 +367,20 @@ def dataframe_to_simple_pdf(df: pd.DataFrame, title: str) -> bytes:
 # Streamlit UI
 # -----------------------------
 st.set_page_config(page_title="Inventaire — Regroupement", layout="wide")
-st.title("Inventaire — Regroupement des médicaments (préfixes fusionnés)")
+st.title("Inventaire — Regroupement des génériques (préfixes fusionnés) + vendeurs séparés")
 
 uploaded = st.file_uploader("Upload inventory file (CSV / Excel / PDF)", type=["csv", "xlsx", "xls", "pdf"])
 
 with st.sidebar:
+    st.header("Vendeurs (seront retirés du nom et mis dans une colonne)")
+    vendors_text = st.text_area(
+        "Une entrée par ligne",
+        value="\n".join(sorted(DEFAULT_VENDORS)),
+        height=120,
+    )
+    vendors = {normalise_space(v).upper() for v in vendors_text.splitlines() if normalise_space(v)}
+
+    st.divider()
     export_pdf = st.checkbox("Générer aussi un PDF", value=False)
     if export_pdf and not REPORTLAB_OK:
         st.warning("PDF export needs reportlab. Add 'reportlab' to requirements.txt.")
@@ -336,27 +399,30 @@ st.success(note)
 st.subheader("Preview")
 st.dataframe(df_raw.head(40), use_container_width=True)
 
-# Quantity detection with fallback UI
+# Quantity detection with fallback
 candidates = detect_quantity_candidates(df_raw)
 best_score, best_idx = candidates[0]
-
 st.caption(f"Auto quantity guess: column {best_idx} (numeric score {best_score:.2f})")
 
 qty_idx = best_idx
-if best_score < 0.30:  # weak detection -> force human choice
-    st.warning("Quantity column auto-detection is weak for this file. Pick the right quantity column below.")
+if best_score < 0.30:
+    st.warning("Quantity auto-detection is weak. Pick the correct quantity column.")
     options = [f"Col {i} (score {s:.2f})" for s, i in candidates[: min(10, len(candidates))]]
     choice = st.selectbox("Select quantity column", options, index=0)
     qty_idx = int(re.search(r"Col (\d+)", choice).group(1))
 
-out, parsed, skipped, hyphen_prefixes = aggregate_inventory(df_raw, qty_idx)
+out, parsed, skipped, prefix_set, hyphen_prefixes = aggregate(df_raw, qty_idx, vendors)
 
 st.write(f"Parsed rows: **{parsed}** — Skipped rows: **{skipped}**")
 
-with st.expander("Préfixes hyphen détectés (debug)"):
+with st.expander("Debug: prefixes utilisés"):
+    st.write("Seed+learned prefix set size:", len(prefix_set))
+    st.write(", ".join(sorted(prefix_set))[:4000])
+
+with st.expander("Debug: prefixes appris par forme AA-XXX"):
     st.write(", ".join(sorted(hyphen_prefixes))[:4000])
 
-st.subheader("Résultat (regroupé)")
+st.subheader("Résultat (regroupé par molécule)")
 st.dataframe(out, use_container_width=True)
 
 # Excel download
@@ -374,7 +440,7 @@ st.download_button(
 # Optional PDF download
 if export_pdf:
     try:
-        pdf_bytes = dataframe_to_simple_pdf(out, "Inventaire regroupé (préfixes fusionnés)")
+        pdf_bytes = dataframe_to_simple_pdf(out, "Inventaire regroupé (molécule)")
         st.download_button(
             "Télécharger PDF (.pdf)",
             data=pdf_bytes,
