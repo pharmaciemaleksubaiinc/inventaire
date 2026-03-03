@@ -1,11 +1,10 @@
 # inventaire.py
-# pip install streamlit pandas openpyxl pdfplumber
-# Optional PDF export:
-#   pip install reportlab
+# pip install streamlit pandas openpyxl pdfplumber pdfminer.six
+# Optional PDF export: pip install reportlab
 
 import io
 import re
-from typing import Optional, Tuple, List
+from typing import List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -27,171 +26,59 @@ except Exception:
     REPORTLAB_OK = False
 
 
-DEFAULT_EXCLUDED_WORDS = {"APO"}  # add more in sidebar
+# -----------------------------
+# Settings
+# -----------------------------
+DEFAULT_EXCLUDED_PREFIXES = {"APO"}  # add more in sidebar
 
 
 # -----------------------------
-# Parsing (your logic, safer)
+# Utils
 # -----------------------------
-def normalise_whitespace(s: str) -> str:
+def normalise_space(s: str) -> str:
     return re.sub(r"\s+", " ", str(s)).strip()
 
 
-def parse_med_cell(cell: object) -> Optional[Tuple[str, str]]:
-    if cell is None:
+def looks_numeric(s: str) -> bool:
+    s = str(s).strip()
+    if not s:
+        return False
+    s = s.replace(",", ".")
+    return bool(re.fullmatch(r"-?\d+(\.\d+)?", s))
+
+
+def to_float_or_none(x) -> Optional[float]:
+    if x is None:
         return None
-    entry = str(cell).strip()
-    if not entry:
+    s = str(x).strip()
+    if not s:
         return None
-    if not entry[0].isdecimal():
+    s = s.replace(",", ".")
+    m = re.search(r"-?\d+(?:\.\d+)?", s)
+    if not m:
         return None
-
-    lines = entry.splitlines()
-    if len(lines) < 2:
-        return None
-
-    med_name = lines[1].strip()
-
-    manufacturer_prefix = ""
-    if len(lines) >= 4 and lines[3].strip():
-        manufacturer_prefix = lines[3].split()[0].strip()
-
-    return med_name, manufacturer_prefix
-
-
-def parse_amount(cell: object) -> Optional[float]:
-    if cell is None:
-        return None
-    text = str(cell).strip()
-    if not text:
+    try:
+        return float(m.group(0))
+    except Exception:
         return None
 
-    lines = text.splitlines()
 
-    # primary: 3rd line first token
-    if len(lines) >= 3:
-        parts = lines[2].split()
-        if parts:
-            token = parts[0].replace(",", ".")
-            try:
-                return float(token)
-            except Exception:
-                pass
-
-    # fallback: any number
-    m = re.search(r"(-?\d+(?:[.,]\d+)?)", text)
-    if m:
-        try:
-            return float(m.group(1).replace(",", "."))
-        except Exception:
-            return None
-    return None
-
-
-def strip_prefix(med_name: str, manufacturer_prefix: str, excluded_words: set) -> str:
-    words = med_name.split()
-    first = words[0].upper() if words else ""
-    if first and (first == manufacturer_prefix.upper() or first in excluded_words):
-        med_name = " ".join(words[1:]).strip()
-    return normalise_whitespace(med_name)
-
-
-def aggregate_inventory(df: pd.DataFrame, med_col_idx: int, amt_col_idx: int, excluded_words: set):
-    hashmap = {}
-    parsed = 0
-    skipped = 0
-
-    med_col = df.iloc[1:, med_col_idx]
-    amt_col = df.iloc[1:, amt_col_idx]
-
-    for med_cell, amt_cell in zip(med_col, amt_col):
-        pm = parse_med_cell(med_cell)
-        if not pm:
-            skipped += 1
-            continue
-        med_name, manufacturer_prefix = pm
-
-        amount = parse_amount(amt_cell)
-        if amount is None:
-            skipped += 1
-            continue
-
-        med_name = strip_prefix(med_name, manufacturer_prefix, excluded_words)
-        if not med_name:
-            skipped += 1
-            continue
-
-        hashmap[med_name] = hashmap.get(med_name, 0.0) + float(amount)
-        parsed += 1
-
-    out = (
-        pd.DataFrame(list(hashmap.items()), columns=["Name", "Amount"])
-        .sort_values("Name")
-        .reset_index(drop=True)
-    )
-    return out, parsed, skipped
+def strip_prefixes(name: str, prefixes: set) -> str:
+    """
+    Removes manufacturer prefixes ONLY if they are the first word.
+    Example: "APO METFORMIN 500MG TAB" -> "METFORMIN 500MG TAB"
+    """
+    name = normalise_space(name)
+    if not name:
+        return name
+    words = name.split()
+    if words and words[0].upper() in prefixes:
+        return normalise_space(" ".join(words[1:]))
+    return name
 
 
 # -----------------------------
-# Auto-detect columns
-# -----------------------------
-def score_med_column(series: pd.Series, sample_n: int = 200) -> int:
-    """
-    Higher score = more rows look like your medication multi-line format.
-    """
-    score = 0
-    for v in series.dropna().astype(str).head(sample_n):
-        v = v.strip()
-        if not v:
-            continue
-        # must start with digit
-        if not v[0].isdecimal():
-            continue
-        lines = v.splitlines()
-        # should have at least 2 lines, and line 2 (index1) should be non-empty
-        if len(lines) >= 2 and lines[1].strip():
-            score += 1
-    return score
-
-
-def score_amount_column(series: pd.Series, sample_n: int = 200) -> int:
-    """
-    Higher score = more values parse as an amount using your rules.
-    """
-    score = 0
-    for v in series.dropna().head(sample_n):
-        if parse_amount(v) is not None:
-            score += 1
-    return score
-
-
-def auto_pick_columns(df: pd.DataFrame) -> Tuple[int, int]:
-    """
-    Picks the best med column and amount column using scoring.
-    """
-    med_scores = []
-    amt_scores = []
-
-    for i in range(df.shape[1]):
-        s = df.iloc[:, i]
-        med_scores.append((score_med_column(s), i))
-        amt_scores.append((score_amount_column(s), i))
-
-    med_scores.sort(reverse=True)  # highest first
-    amt_scores.sort(reverse=True)
-
-    best_med = med_scores[0][1]
-    best_amt = amt_scores[0][1]
-
-    # If it accidentally picks same column, choose next best amount
-    if best_amt == best_med and len(amt_scores) > 1:
-        best_amt = amt_scores[1][1]
-
-    return best_med, best_amt
-
-
-# -----------------------------
-# Reading files
+# Read files
 # -----------------------------
 def read_pdf_to_dataframe(uploaded_file) -> pd.DataFrame:
     if not PDFPLUMBER_OK:
@@ -215,9 +102,9 @@ def read_pdf_to_dataframe(uploaded_file) -> pd.DataFrame:
         raise RuntimeError("No tables detected in PDF. If it's a scanned PDF, you need OCR.")
 
     padded = []
-    for row in all_rows:
-        row = row + [None] * (max_cols - len(row))
-        padded.append(row)
+    for r in all_rows:
+        r = r + [None] * (max_cols - len(r))
+        padded.append(r)
 
     return pd.DataFrame(padded)
 
@@ -238,16 +125,115 @@ def read_uploaded_file(uploaded_file) -> Tuple[pd.DataFrame, str]:
 
 
 # -----------------------------
-# Export PDF (optional)
+# Auto-detect & aggregate (FIXED)
 # -----------------------------
-def dataframe_to_simple_pdf(df: pd.DataFrame, title: str = "Inventaire réorganisé") -> bytes:
+def detect_quantity_column(df: pd.DataFrame) -> int:
+    """
+    Chooses the column with the highest ratio of numeric-ish values.
+    """
+    best_idx = 0
+    best_score = -1
+
+    for i in range(df.shape[1]):
+        col = df.iloc[:, i].dropna().astype(str).head(300)
+        if len(col) == 0:
+            continue
+        numeric_hits = sum(1 for v in col if to_float_or_none(v) is not None)
+        score = numeric_hits / max(1, len(col))
+        if score > best_score:
+            best_score = score
+            best_idx = i
+
+    return best_idx
+
+
+def detect_text_columns(df: pd.DataFrame, qty_idx: int) -> List[int]:
+    """
+    Picks columns likely to be description columns: non-numeric, longer text.
+    """
+    candidates = []
+    for i in range(df.shape[1]):
+        if i == qty_idx:
+            continue
+        sample = df.iloc[:, i].dropna().astype(str).head(200)
+        if len(sample) == 0:
+            continue
+        # Textiness: average length * fraction non-numeric
+        avg_len = sum(len(v.strip()) for v in sample) / max(1, len(sample))
+        non_numeric_frac = sum(1 for v in sample if not looks_numeric(v)) / max(1, len(sample))
+        score = avg_len * non_numeric_frac
+        candidates.append((score, i))
+
+    candidates.sort(reverse=True)
+    # keep top 3-5 text columns (usually description is spread across a few)
+    return [i for _, i in candidates[:5]]
+
+
+def build_description(row: pd.Series, text_cols: List[int]) -> str:
+    parts = []
+    for i in text_cols:
+        v = row.iloc[i]
+        if v is None:
+            continue
+        s = normalise_space(v)
+        if not s:
+            continue
+        # ignore cells that are just separators or tiny garbage
+        if len(s) <= 1:
+            continue
+        parts.append(s)
+    return normalise_space(" ".join(parts))
+
+
+def aggregate_inventory_table_style(df: pd.DataFrame, prefixes: set) -> Tuple[pd.DataFrame, int, int, int]:
+    """
+    Aggregates quantities by cleaned medication description, for table-style exports.
+    """
+    qty_idx = detect_quantity_column(df)
+    text_cols = detect_text_columns(df, qty_idx)
+
+    totals = {}
+    parsed = 0
+    skipped = 0
+
+    for _, row in df.iterrows():
+        qty = to_float_or_none(row.iloc[qty_idx])
+        if qty is None:
+            skipped += 1
+            continue
+
+        desc = build_description(row, text_cols)
+        desc = strip_prefixes(desc, prefixes)
+
+        # Extra cleanup: drop pure units-only rows like "0.4 mL" if they happen
+        # Keep if there's at least one letter AND at least 6 chars
+        if not re.search(r"[A-Za-zÀ-ÿ]", desc) or len(desc) < 6:
+            skipped += 1
+            continue
+
+        totals[desc] = totals.get(desc, 0.0) + float(qty)
+        parsed += 1
+
+    out = (
+        pd.DataFrame(list(totals.items()), columns=["Name", "Amount"])
+        .sort_values("Name")
+        .reset_index(drop=True)
+    )
+
+    return out, qty_idx, parsed, skipped
+
+
+# -----------------------------
+# PDF export (optional)
+# -----------------------------
+def dataframe_to_simple_pdf(df: pd.DataFrame, title: str) -> bytes:
     if not REPORTLAB_OK:
         raise RuntimeError("PDF export requires reportlab. Add 'reportlab' to requirements.txt.")
 
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=letter)
-
     width, height = letter
+
     x = 0.75 * inch
     y = height - 0.75 * inch
 
@@ -256,19 +242,17 @@ def dataframe_to_simple_pdf(df: pd.DataFrame, title: str = "Inventaire réorgani
     y -= 0.35 * inch
 
     c.setFont("Helvetica", 10)
-    line_height = 12
+    lh = 12
 
-    # Header
-    header = f"{'Name':60}  {'Amount':>10}"
-    c.drawString(x, y, header)
-    y -= line_height
-    c.drawString(x, y, "-" * 80)
-    y -= line_height
+    c.drawString(x, y, f"{'Name':70} {'Amount':>10}")
+    y -= lh
+    c.drawString(x, y, "-" * 90)
+    y -= lh
 
-    for _, row in df.iterrows():
-        name = str(row["Name"])[:60]
-        amt = f"{row['Amount']:.2f}"
-        line = f"{name:60}  {amt:>10}"
+    for _, r in df.iterrows():
+        name = str(r["Name"])[:70]
+        amt = f"{r['Amount']:.2f}"
+        line = f"{name:70} {amt:>10}"
 
         if y < 0.75 * inch:
             c.showPage()
@@ -276,31 +260,30 @@ def dataframe_to_simple_pdf(df: pd.DataFrame, title: str = "Inventaire réorgani
             c.setFont("Helvetica", 10)
 
         c.drawString(x, y, line)
-        y -= line_height
+        y -= lh
 
     c.save()
     return buf.getvalue()
 
 
 # -----------------------------
-# UI
+# Streamlit UI
 # -----------------------------
 st.set_page_config(page_title="Inventaire — Nettoyage & Fusion", layout="wide")
-st.title("Inventaire — Nettoyage & fusion (prefixes ignorés)")
+st.title("Inventaire réorganisé (prefixes supprimés + totaux)")
 
 uploaded = st.file_uploader("Upload inventory file (CSV / Excel / PDF)", type=["csv", "xlsx", "xls", "pdf"])
 
 with st.sidebar:
-    st.header("Règles")
+    st.header("Prefixes à ignorer")
     excluded_text = st.text_input(
-        "Prefixes à ignorer (séparés par virgules)",
-        value=",".join(sorted(DEFAULT_EXCLUDED_WORDS)),
-        help="Ex: APO,SANDOZ,TEVA"
+        "Séparés par virgules",
+        value=",".join(sorted(DEFAULT_EXCLUDED_PREFIXES)),
+        help="Ex: APO,SANDOZ,TEVA,MYLAN"
     )
-    excluded_words = {w.strip().upper() for w in excluded_text.split(",") if w.strip()}
+    prefixes = {p.strip().upper() for p in excluded_text.split(",") if p.strip()}
 
     st.divider()
-    st.header("Exports")
     export_pdf = st.checkbox("Générer aussi un PDF", value=False)
     if export_pdf and not REPORTLAB_OK:
         st.warning("PDF export needs reportlab. Add 'reportlab' to requirements.txt.")
@@ -316,16 +299,15 @@ except Exception as e:
     st.stop()
 
 st.success(note)
+st.subheader("Preview")
+st.dataframe(df_raw.head(40), use_container_width=True)
 
-# Auto pick columns
-med_col_idx, amt_col_idx = auto_pick_columns(df_raw)
-st.caption(f"Auto-detected columns → Medication: {med_col_idx} | Amount: {amt_col_idx}")
+out, qty_idx, parsed, skipped = aggregate_inventory_table_style(df_raw, prefixes)
 
-# Run aggregation
-out, parsed, skipped = aggregate_inventory(df_raw, med_col_idx, amt_col_idx, excluded_words)
-
-st.subheader("Inventaire réorganisé (prefixes supprimés + totaux)")
+st.caption(f"Auto-detected quantity column: {qty_idx}")
 st.write(f"Parsed rows: **{parsed}** — Skipped rows: **{skipped}**")
+
+st.subheader("Résultat")
 st.dataframe(out, use_container_width=True)
 
 # Excel download
@@ -343,7 +325,7 @@ st.download_button(
 # PDF download (optional)
 if export_pdf:
     try:
-        pdf_bytes = dataframe_to_simple_pdf(out, title="Inventaire réorganisé (prefixes ignorés)")
+        pdf_bytes = dataframe_to_simple_pdf(out, "Inventaire réorganisé (prefixes supprimés + totaux)")
         st.download_button(
             "Télécharger PDF (.pdf)",
             data=pdf_bytes,
