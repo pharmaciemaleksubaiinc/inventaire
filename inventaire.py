@@ -4,7 +4,7 @@
 
 import io
 import re
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Set
 
 import pandas as pd
 import streamlit as st
@@ -27,9 +27,13 @@ except Exception:
 
 
 # -----------------------------
-# Settings
+# Seed prefixes (Canada-typical, not “APO-only”)
+# This is a STARTER set; the app also learns from YOUR file automatically.
 # -----------------------------
-DEFAULT_EXCLUDED_PREFIXES = {"APO"}  # add more in sidebar
+CANADA_PREFIX_SEED = {
+    "AA", "APO", "PMS", "RATIO", "TEVA", "SANDOZ", "AURO", "JAMP", "MINT",
+    "MYLAN", "TARO", "ACT", "ACC", "NOVO", "RAN", "PHL", "BIO", "OPUS",
+}
 
 
 # -----------------------------
@@ -39,12 +43,12 @@ def normalise_space(s: str) -> str:
     return re.sub(r"\s+", " ", str(s)).strip()
 
 
-def looks_numeric(s: str) -> bool:
-    s = str(s).strip()
+def looks_numeric_cell(x) -> bool:
+    s = str(x).strip()
     if not s:
         return False
     s = s.replace(",", ".")
-    return bool(re.fullmatch(r"-?\d+(\.\d+)?", s))
+    return bool(re.search(r"-?\d+(?:\.\d+)?", s))
 
 
 def to_float_or_none(x) -> Optional[float]:
@@ -63,23 +67,6 @@ def to_float_or_none(x) -> Optional[float]:
         return None
 
 
-def strip_prefixes(name: str, prefixes: set) -> str:
-    """
-    Removes manufacturer prefixes ONLY if they are the first word.
-    Example: "APO METFORMIN 500MG TAB" -> "METFORMIN 500MG TAB"
-    """
-    name = normalise_space(name)
-    if not name:
-        return name
-    words = name.split()
-    if words and words[0].upper() in prefixes:
-        return normalise_space(" ".join(words[1:]))
-    return name
-
-
-# -----------------------------
-# Read files
-# -----------------------------
 def read_pdf_to_dataframe(uploaded_file) -> pd.DataFrame:
     if not PDFPLUMBER_OK:
         raise RuntimeError("PDF support not installed. Add pdfplumber to requirements.txt.")
@@ -89,9 +76,8 @@ def read_pdf_to_dataframe(uploaded_file) -> pd.DataFrame:
 
     with pdfplumber.open(uploaded_file) as pdf:
         for page in pdf.pages:
-            tables = page.extract_tables()
-            for table in tables:
-                for row in table:
+            for table in page.extract_tables() or []:
+                for row in table or []:
                     if row is None:
                         continue
                     row = list(row)
@@ -101,11 +87,7 @@ def read_pdf_to_dataframe(uploaded_file) -> pd.DataFrame:
     if not all_rows:
         raise RuntimeError("No tables detected in PDF. If it's a scanned PDF, you need OCR.")
 
-    padded = []
-    for r in all_rows:
-        r = r + [None] * (max_cols - len(r))
-        padded.append(r)
-
+    padded = [r + [None] * (max_cols - len(r)) for r in all_rows]
     return pd.DataFrame(padded)
 
 
@@ -114,10 +96,8 @@ def read_uploaded_file(uploaded_file) -> Tuple[pd.DataFrame, str]:
 
     if name.endswith(".csv"):
         return pd.read_csv(uploaded_file), "Loaded CSV"
-
     if name.endswith(".xlsx") or name.endswith(".xls"):
         return pd.read_excel(uploaded_file), "Loaded Excel"
-
     if name.endswith(".pdf"):
         return read_pdf_to_dataframe(uploaded_file), "Loaded PDF (via pdfplumber)"
 
@@ -125,21 +105,18 @@ def read_uploaded_file(uploaded_file) -> Tuple[pd.DataFrame, str]:
 
 
 # -----------------------------
-# Auto-detect & aggregate (FIXED)
+# Auto-detect columns (table-style)
 # -----------------------------
 def detect_quantity_column(df: pd.DataFrame) -> int:
-    """
-    Chooses the column with the highest ratio of numeric-ish values.
-    """
     best_idx = 0
-    best_score = -1
+    best_score = -1.0
 
     for i in range(df.shape[1]):
-        col = df.iloc[:, i].dropna().astype(str).head(300)
+        col = df.iloc[:, i].dropna().head(400)
         if len(col) == 0:
             continue
-        numeric_hits = sum(1 for v in col if to_float_or_none(v) is not None)
-        score = numeric_hits / max(1, len(col))
+        hits = sum(1 for v in col if to_float_or_none(v) is not None)
+        score = hits / max(1, len(col))
         if score > best_score:
             best_score = score
             best_idx = i
@@ -148,25 +125,19 @@ def detect_quantity_column(df: pd.DataFrame) -> int:
 
 
 def detect_text_columns(df: pd.DataFrame, qty_idx: int) -> List[int]:
-    """
-    Picks columns likely to be description columns: non-numeric, longer text.
-    """
     candidates = []
     for i in range(df.shape[1]):
         if i == qty_idx:
             continue
-        sample = df.iloc[:, i].dropna().astype(str).head(200)
+        sample = df.iloc[:, i].dropna().astype(str).head(250)
         if len(sample) == 0:
             continue
-        # Textiness: average length * fraction non-numeric
-        avg_len = sum(len(v.strip()) for v in sample) / max(1, len(sample))
-        non_numeric_frac = sum(1 for v in sample if not looks_numeric(v)) / max(1, len(sample))
-        score = avg_len * non_numeric_frac
-        candidates.append((score, i))
+        avg_len = sum(len(s.strip()) for s in sample) / max(1, len(sample))
+        non_num = sum(1 for s in sample if not looks_numeric_cell(s)) / max(1, len(sample))
+        candidates.append((avg_len * non_num, i))
 
     candidates.sort(reverse=True)
-    # keep top 3-5 text columns (usually description is spread across a few)
-    return [i for _, i in candidates[:5]]
+    return [i for _, i in candidates[:6]]  # join up to 6 text columns
 
 
 def build_description(row: pd.Series, text_cols: List[int]) -> str:
@@ -176,23 +147,94 @@ def build_description(row: pd.Series, text_cols: List[int]) -> str:
         if v is None:
             continue
         s = normalise_space(v)
-        if not s:
-            continue
-        # ignore cells that are just separators or tiny garbage
-        if len(s) <= 1:
+        if not s or len(s) <= 1:
             continue
         parts.append(s)
     return normalise_space(" ".join(parts))
 
 
-def aggregate_inventory_table_style(df: pd.DataFrame, prefixes: set) -> Tuple[pd.DataFrame, int, int, int]:
+# -----------------------------
+# Prefix learning + stripping
+# -----------------------------
+def guess_prefixes_from_descriptions(desc_series: pd.Series, min_count: int = 3) -> Set[str]:
     """
-    Aggregates quantities by cleaned medication description, for table-style exports.
+    Learns candidate prefixes from your file.
+    Rules:
+      - take first token OR token before '-' if present
+      - alphabetic only
+      - short-ish (1–8 chars)
+      - appears >= min_count
     """
+    counts: Dict[str, int] = {}
+
+    for raw in desc_series.dropna().astype(str).head(5000):
+        s = normalise_space(raw)
+        if not s:
+            continue
+
+        # token before '-' is strong signal (e.g., "PMS-FLUOXETINE")
+        m = re.match(r"^([A-Za-z]{1,8})\s*-\s*(.+)$", s)
+        if m:
+            p = m.group(1).upper()
+        else:
+            p = s.split()[0].upper()
+
+        if p.isalpha() and 1 <= len(p) <= 8:
+            counts[p] = counts.get(p, 0) + 1
+
+    return {p for p, c in counts.items() if c >= min_count}
+
+
+def split_prefix_and_core(desc: str, known_prefixes: Set[str]) -> Tuple[Optional[str], str]:
+    """
+    Accepts:
+      - "PMS-FLUOXETINE ..."  -> ("PMS", "FLUOXETINE ...")
+      - "PMS FLUOXETINE ..."  -> ("PMS", "FLUOXETINE ...")
+      - "aa-fluoxetine"       -> ("AA", "FLUOXETINE")
+    Only strips if prefix is in known_prefixes.
+    """
+    s = normalise_space(desc)
+    if not s:
+        return None, s
+
+    # hyphen form
+    m = re.match(r"^([A-Za-z]{1,8})\s*-\s*(.+)$", s)
+    if m:
+        p = m.group(1).upper()
+        rest = m.group(2)
+        if p in known_prefixes:
+            return p, normalise_space(rest)
+
+    # space form
+    first = s.split()[0].upper()
+    if first in known_prefixes:
+        rest = " ".join(s.split()[1:])
+        return first, normalise_space(rest)
+
+    return None, s
+
+
+# -----------------------------
+# Aggregate with brand/prefix list
+# -----------------------------
+def aggregate_inventory_with_brands(df: pd.DataFrame) -> Tuple[pd.DataFrame, int, int, int, Set[str]]:
     qty_idx = detect_quantity_column(df)
     text_cols = detect_text_columns(df, qty_idx)
 
-    totals = {}
+    # Build quick descriptions to learn prefixes from THIS file
+    tmp_desc = []
+    for _, row in df.iterrows():
+        d = build_description(row, text_cols)
+        if d:
+            tmp_desc.append(d)
+    desc_series = pd.Series(tmp_desc)
+
+    learned = guess_prefixes_from_descriptions(desc_series, min_count=3)
+    known_prefixes = set(CANADA_PREFIX_SEED) | learned
+
+    totals: Dict[str, float] = {}
+    brands: Dict[str, Set[str]] = {}
+
     parsed = 0
     skipped = 0
 
@@ -203,24 +245,33 @@ def aggregate_inventory_table_style(df: pd.DataFrame, prefixes: set) -> Tuple[pd
             continue
 
         desc = build_description(row, text_cols)
-        desc = strip_prefixes(desc, prefixes)
-
-        # Extra cleanup: drop pure units-only rows like "0.4 mL" if they happen
-        # Keep if there's at least one letter AND at least 6 chars
-        if not re.search(r"[A-Za-zÀ-ÿ]", desc) or len(desc) < 6:
+        if not desc:
             skipped += 1
             continue
 
-        totals[desc] = totals.get(desc, 0.0) + float(qty)
+        prefix, core = split_prefix_and_core(desc, known_prefixes)
+
+        # Filter out garbage rows like only units/packaging fragments
+        if not re.search(r"[A-Za-zÀ-ÿ]", core) or len(core) < 6:
+            skipped += 1
+            continue
+
+        totals[core] = totals.get(core, 0.0) + float(qty)
+
+        if prefix:
+            brands.setdefault(core, set()).add(prefix)
+
         parsed += 1
 
-    out = (
-        pd.DataFrame(list(totals.items()), columns=["Name", "Amount"])
-        .sort_values("Name")
-        .reset_index(drop=True)
-    )
+    out = pd.DataFrame(
+        {
+            "Médicament (nom regroupé)": list(totals.keys()),
+            "Quantité totale": [totals[k] for k in totals.keys()],
+            "Marques / Préfixes trouvés": [", ".join(sorted(brands.get(k, set()))) for k in totals.keys()],
+        }
+    ).sort_values("Médicament (nom regroupé)").reset_index(drop=True)
 
-    return out, qty_idx, parsed, skipped
+    return out, qty_idx, parsed, skipped, known_prefixes
 
 
 # -----------------------------
@@ -234,30 +285,32 @@ def dataframe_to_simple_pdf(df: pd.DataFrame, title: str) -> bytes:
     c = canvas.Canvas(buf, pagesize=letter)
     width, height = letter
 
-    x = 0.75 * inch
+    x = 0.65 * inch
     y = height - 0.75 * inch
 
     c.setFont("Helvetica-Bold", 14)
     c.drawString(x, y, title)
     y -= 0.35 * inch
 
-    c.setFont("Helvetica", 10)
-    lh = 12
+    c.setFont("Helvetica", 9)
+    lh = 11
 
-    c.drawString(x, y, f"{'Name':70} {'Amount':>10}")
+    headers = ["Médicament (nom regroupé)", "Quantité totale", "Marques / Préfixes trouvés"]
+    c.drawString(x, y, f"{headers[0][:55]:55}  {headers[1]:>12}  {headers[2]}")
     y -= lh
-    c.drawString(x, y, "-" * 90)
+    c.drawString(x, y, "-" * 110)
     y -= lh
 
     for _, r in df.iterrows():
-        name = str(r["Name"])[:70]
-        amt = f"{r['Amount']:.2f}"
-        line = f"{name:70} {amt:>10}"
+        name = str(r[headers[0]])[:55]
+        qty = f"{float(r[headers[1]]):.2f}"
+        pref = str(r[headers[2]])[:45]
+        line = f"{name:55}  {qty:>12}  {pref}"
 
         if y < 0.75 * inch:
             c.showPage()
             y = height - 0.75 * inch
-            c.setFont("Helvetica", 10)
+            c.setFont("Helvetica", 9)
 
         c.drawString(x, y, line)
         y -= lh
@@ -269,21 +322,16 @@ def dataframe_to_simple_pdf(df: pd.DataFrame, title: str) -> bytes:
 # -----------------------------
 # Streamlit UI
 # -----------------------------
-st.set_page_config(page_title="Inventaire — Nettoyage & Fusion", layout="wide")
-st.title("Inventaire réorganisé (prefixes supprimés + totaux)")
+st.set_page_config(page_title="Inventaire — Regroupement (préfixes)", layout="wide")
+st.title("Inventaire — Regroupement des génériques (préfixes → même médicament)")
 
 uploaded = st.file_uploader("Upload inventory file (CSV / Excel / PDF)", type=["csv", "xlsx", "xls", "pdf"])
 
 with st.sidebar:
-    st.header("Prefixes à ignorer")
-    excluded_text = st.text_input(
-        "Séparés par virgules",
-        value=",".join(sorted(DEFAULT_EXCLUDED_PREFIXES)),
-        help="Ex: APO,SANDOZ,TEVA,MYLAN"
-    )
-    prefixes = {p.strip().upper() for p in excluded_text.split(",") if p.strip()}
+    st.header("Contrôles (optionnels)")
+    extra_add = st.text_input("Ajouter des préfixes (comma-separated)", value="")
+    extra_remove = st.text_input("Forcer à NE PAS traiter comme préfixe (comma-separated)", value="")
 
-    st.divider()
     export_pdf = st.checkbox("Générer aussi un PDF", value=False)
     if export_pdf and not REPORTLAB_OK:
         st.warning("PDF export needs reportlab. Add 'reportlab' to requirements.txt.")
@@ -302,34 +350,78 @@ st.success(note)
 st.subheader("Preview")
 st.dataframe(df_raw.head(40), use_container_width=True)
 
-out, qty_idx, parsed, skipped = aggregate_inventory_table_style(df_raw, prefixes)
+out, qty_idx, parsed, skipped, known_prefixes = aggregate_inventory_with_brands(df_raw)
+
+# Apply optional user tweaks AFTER detection
+add_set = {p.strip().upper() for p in extra_add.split(",") if p.strip()}
+remove_set = {p.strip().upper() for p in extra_remove.split(",") if p.strip()}
+
+if add_set or remove_set:
+    # Re-run aggregation with modified known_prefixes
+    # (quick re-run: we just hack known_prefixes and recompute)
+    # For simplicity: rebuild with the adjusted set by calling a modified version inline.
+    # ---- minimal recompute ----
+    qty_idx = detect_quantity_column(df_raw)
+    text_cols = detect_text_columns(df_raw, qty_idx)
+    adjusted = (known_prefixes | add_set) - remove_set
+
+    totals, brands = {}, {}
+    parsed, skipped = 0, 0
+    for _, row in df_raw.iterrows():
+        qty = to_float_or_none(row.iloc[qty_idx])
+        if qty is None:
+            skipped += 1
+            continue
+        desc = build_description(row, text_cols)
+        if not desc:
+            skipped += 1
+            continue
+        prefix, core = split_prefix_and_core(desc, adjusted)
+        if not re.search(r"[A-Za-zÀ-ÿ]", core) or len(core) < 6:
+            skipped += 1
+            continue
+        totals[core] = totals.get(core, 0.0) + float(qty)
+        if prefix:
+            brands.setdefault(core, set()).add(prefix)
+        parsed += 1
+
+    out = pd.DataFrame(
+        {
+            "Médicament (nom regroupé)": list(totals.keys()),
+            "Quantité totale": [totals[k] for k in totals.keys()],
+            "Marques / Préfixes trouvés": [", ".join(sorted(brands.get(k, set()))) for k in totals.keys()],
+        }
+    ).sort_values("Médicament (nom regroupé)").reset_index(drop=True)
 
 st.caption(f"Auto-detected quantity column: {qty_idx}")
 st.write(f"Parsed rows: **{parsed}** — Skipped rows: **{skipped}**")
 
-st.subheader("Résultat")
+with st.expander("Préfixes détectés / utilisés (debug)"):
+    st.write(", ".join(sorted(known_prefixes))[:2000])
+
+st.subheader("Résultat (regroupé)")
 st.dataframe(out, use_container_width=True)
 
 # Excel download
 excel_buf = io.BytesIO()
 with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
-    out.to_excel(writer, index=False, sheet_name="Inventaire")
+    out.to_excel(writer, index=False, sheet_name="Inventaire_regroupe")
 
 st.download_button(
     "Télécharger Excel (.xlsx)",
     data=excel_buf.getvalue(),
-    file_name="inventaire_reorganise.xlsx",
+    file_name="inventaire_regroupe.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
 
-# PDF download (optional)
+# Optional PDF download
 if export_pdf:
     try:
-        pdf_bytes = dataframe_to_simple_pdf(out, "Inventaire réorganisé (prefixes supprimés + totaux)")
+        pdf_bytes = dataframe_to_simple_pdf(out, "Inventaire regroupé (préfixes → même médicament)")
         st.download_button(
             "Télécharger PDF (.pdf)",
             data=pdf_bytes,
-            file_name="inventaire_reorganise.pdf",
+            file_name="inventaire_regroupe.pdf",
             mime="application/pdf",
         )
     except Exception as e:
