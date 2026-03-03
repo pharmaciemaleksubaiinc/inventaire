@@ -1,48 +1,48 @@
-# app.py
-# Streamlit Med Logger — supports CSV / Excel / PDF (via pdfplumber)
-# Run:
-#   pip install streamlit pandas openpyxl pdfplumber
-#   streamlit run app.py
+# inventaire.py
+# pip install streamlit pandas openpyxl pdfplumber
+# Optional PDF export:
+#   pip install reportlab
 
 import io
 import re
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import pandas as pd
 import streamlit as st
-import pdfplumber
+
+# PDF read
+try:
+    import pdfplumber
+    PDFPLUMBER_OK = True
+except Exception:
+    PDFPLUMBER_OK = False
+
+# Optional PDF export
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.units import inch
+    REPORTLAB_OK = True
+except Exception:
+    REPORTLAB_OK = False
+
+
+DEFAULT_EXCLUDED_WORDS = {"APO"}  # add more in sidebar
 
 
 # -----------------------------
-# Config
-# -----------------------------
-DEFAULT_EXCLUDED_WORDS = {"APO"}  # add more: SANDOZ, TEVA, MYLAN, etc.
-
-
-# -----------------------------
-# Parsing helpers (your original logic, but safer)
+# Parsing (your logic, safer)
 # -----------------------------
 def normalise_whitespace(s: str) -> str:
     return re.sub(r"\s+", " ", str(s)).strip()
 
 
 def parse_med_cell(cell: object) -> Optional[Tuple[str, str]]:
-    """
-    Matches your original rules:
-      - treat the "med info" cell as multi-line text
-      - skip row if first char isn't a digit
-      - lines[1] is medName
-      - lines[3].split()[0] is manufacturer prefix (if exists)
-    Returns (med_name, manufacturer_prefix) or None if not a medication row.
-    """
     if cell is None:
         return None
-
     entry = str(cell).strip()
     if not entry:
         return None
-
-    # Original condition: entry[0].isdecimal()
     if not entry[0].isdecimal():
         return None
 
@@ -60,21 +60,15 @@ def parse_med_cell(cell: object) -> Optional[Tuple[str, str]]:
 
 
 def parse_amount(cell: object) -> Optional[float]:
-    """
-    Your original:
-      float(entry2.splitlines()[2].split()[0])
-    but with guardrails + fallback.
-    """
     if cell is None:
         return None
-
     text = str(cell).strip()
     if not text:
         return None
 
     lines = text.splitlines()
 
-    # Primary: 3rd line, first token (like your code)
+    # primary: 3rd line first token
     if len(lines) >= 3:
         parts = lines[2].split()
         if parts:
@@ -84,51 +78,45 @@ def parse_amount(cell: object) -> Optional[float]:
             except Exception:
                 pass
 
-    # Fallback: first number anywhere
+    # fallback: any number
     m = re.search(r"(-?\d+(?:[.,]\d+)?)", text)
     if m:
         try:
             return float(m.group(1).replace(",", "."))
         except Exception:
             return None
-
     return None
 
 
+def strip_prefix(med_name: str, manufacturer_prefix: str, excluded_words: set) -> str:
+    words = med_name.split()
+    first = words[0].upper() if words else ""
+    if first and (first == manufacturer_prefix.upper() or first in excluded_words):
+        med_name = " ".join(words[1:]).strip()
+    return normalise_whitespace(med_name)
+
+
 def aggregate_inventory(df: pd.DataFrame, med_col_idx: int, amt_col_idx: int, excluded_words: set):
-    """
-    Aggregates medication amounts by name.
-    Keeps your manufacturer-prefix stripping logic:
-      if medName first word == manufacturer prefix OR first word in excluded_words => remove it
-    """
     hashmap = {}
     parsed = 0
     skipped = 0
 
-    # Like your code: start from row index 1 (skip first row)
     med_col = df.iloc[1:, med_col_idx]
     amt_col = df.iloc[1:, amt_col_idx]
 
     for med_cell, amt_cell in zip(med_col, amt_col):
-        parsed_med = parse_med_cell(med_cell)
-        if not parsed_med:
+        pm = parse_med_cell(med_cell)
+        if not pm:
             skipped += 1
             continue
+        med_name, manufacturer_prefix = pm
 
-        med_name, manufacturer_prefix = parsed_med
         amount = parse_amount(amt_cell)
-
         if amount is None:
             skipped += 1
             continue
 
-        words = med_name.split()
-        first_word = words[0].upper() if words else ""
-
-        if first_word and (first_word == manufacturer_prefix.upper() or first_word in excluded_words):
-            med_name = " ".join(words[1:]).strip()
-
-        med_name = normalise_whitespace(med_name)
+        med_name = strip_prefix(med_name, manufacturer_prefix, excluded_words)
         if not med_name:
             skipped += 1
             continue
@@ -141,26 +129,77 @@ def aggregate_inventory(df: pd.DataFrame, med_col_idx: int, amt_col_idx: int, ex
         .sort_values("Name")
         .reset_index(drop=True)
     )
-
     return out, parsed, skipped
 
 
 # -----------------------------
-# File reading (CSV / Excel / PDF via pdfplumber)
+# Auto-detect columns
+# -----------------------------
+def score_med_column(series: pd.Series, sample_n: int = 200) -> int:
+    """
+    Higher score = more rows look like your medication multi-line format.
+    """
+    score = 0
+    for v in series.dropna().astype(str).head(sample_n):
+        v = v.strip()
+        if not v:
+            continue
+        # must start with digit
+        if not v[0].isdecimal():
+            continue
+        lines = v.splitlines()
+        # should have at least 2 lines, and line 2 (index1) should be non-empty
+        if len(lines) >= 2 and lines[1].strip():
+            score += 1
+    return score
+
+
+def score_amount_column(series: pd.Series, sample_n: int = 200) -> int:
+    """
+    Higher score = more values parse as an amount using your rules.
+    """
+    score = 0
+    for v in series.dropna().head(sample_n):
+        if parse_amount(v) is not None:
+            score += 1
+    return score
+
+
+def auto_pick_columns(df: pd.DataFrame) -> Tuple[int, int]:
+    """
+    Picks the best med column and amount column using scoring.
+    """
+    med_scores = []
+    amt_scores = []
+
+    for i in range(df.shape[1]):
+        s = df.iloc[:, i]
+        med_scores.append((score_med_column(s), i))
+        amt_scores.append((score_amount_column(s), i))
+
+    med_scores.sort(reverse=True)  # highest first
+    amt_scores.sort(reverse=True)
+
+    best_med = med_scores[0][1]
+    best_amt = amt_scores[0][1]
+
+    # If it accidentally picks same column, choose next best amount
+    if best_amt == best_med and len(amt_scores) > 1:
+        best_amt = amt_scores[1][1]
+
+    return best_med, best_amt
+
+
+# -----------------------------
+# Reading files
 # -----------------------------
 def read_pdf_to_dataframe(uploaded_file) -> pd.DataFrame:
-    """
-    Extracts tables from PDF pages using pdfplumber.
-    Returns a dataframe built from concatenated table rows.
+    if not PDFPLUMBER_OK:
+        raise RuntimeError("PDF support not installed. Add pdfplumber to requirements.txt.")
 
-    Notes:
-    - Works best when the PDF has real tables (not scanned images).
-    - pdfplumber outputs list-of-rows, each row is list of cell strings (or None).
-    """
-    all_rows = []
+    all_rows: List[List[object]] = []
     max_cols = 0
 
-    # pdfplumber can open a file-like object, but Streamlit's UploadedFile is fine.
     with pdfplumber.open(uploaded_file) as pdf:
         for page in pdf.pages:
             tables = page.extract_tables()
@@ -168,62 +207,103 @@ def read_pdf_to_dataframe(uploaded_file) -> pd.DataFrame:
                 for row in table:
                     if row is None:
                         continue
+                    row = list(row)
                     max_cols = max(max_cols, len(row))
                     all_rows.append(row)
 
     if not all_rows:
-        raise RuntimeError("No tables detected in PDF. If this PDF is a scan/image, you need OCR instead.")
+        raise RuntimeError("No tables detected in PDF. If it's a scanned PDF, you need OCR.")
 
-    # Pad rows to same width
     padded = []
     for row in all_rows:
-        row = list(row)
-        row += [None] * (max_cols - len(row))
+        row = row + [None] * (max_cols - len(row))
         padded.append(row)
 
-    df = pd.DataFrame(padded)
-    return df
+    return pd.DataFrame(padded)
 
 
 def read_uploaded_file(uploaded_file) -> Tuple[pd.DataFrame, str]:
     name = uploaded_file.name.lower()
 
     if name.endswith(".csv"):
-        df = pd.read_csv(uploaded_file)
-        return df, "Loaded CSV"
+        return pd.read_csv(uploaded_file), "Loaded CSV"
 
     if name.endswith(".xlsx") or name.endswith(".xls"):
-        df = pd.read_excel(uploaded_file)
-        return df, "Loaded Excel"
+        return pd.read_excel(uploaded_file), "Loaded Excel"
 
     if name.endswith(".pdf"):
-        df = read_pdf_to_dataframe(uploaded_file)
-        return df, "Loaded PDF (via pdfplumber)"
+        return read_pdf_to_dataframe(uploaded_file), "Loaded PDF (via pdfplumber)"
 
     raise RuntimeError("Unsupported file type. Upload CSV, XLSX, or PDF.")
 
 
 # -----------------------------
-# Streamlit UI
+# Export PDF (optional)
 # -----------------------------
-st.set_page_config(page_title="Med Logger (Inventory Aggregator)", layout="wide")
-st.title("Med Logger — Inventory Aggregator (CSV / Excel / PDF)")
+def dataframe_to_simple_pdf(df: pd.DataFrame, title: str = "Inventaire réorganisé") -> bytes:
+    if not REPORTLAB_OK:
+        raise RuntimeError("PDF export requires reportlab. Add 'reportlab' to requirements.txt.")
 
-st.write(
-    "Upload your inventory file, choose the columns for **Medication info** and **Amount**, "
-    "then it will merge manufacturer variants (like APO) and sum totals."
-)
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=letter)
 
-uploaded = st.file_uploader("Upload inventory file", type=["csv", "xlsx", "xls", "pdf"])
+    width, height = letter
+    x = 0.75 * inch
+    y = height - 0.75 * inch
+
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(x, y, title)
+    y -= 0.35 * inch
+
+    c.setFont("Helvetica", 10)
+    line_height = 12
+
+    # Header
+    header = f"{'Name':60}  {'Amount':>10}"
+    c.drawString(x, y, header)
+    y -= line_height
+    c.drawString(x, y, "-" * 80)
+    y -= line_height
+
+    for _, row in df.iterrows():
+        name = str(row["Name"])[:60]
+        amt = f"{row['Amount']:.2f}"
+        line = f"{name:60}  {amt:>10}"
+
+        if y < 0.75 * inch:
+            c.showPage()
+            y = height - 0.75 * inch
+            c.setFont("Helvetica", 10)
+
+        c.drawString(x, y, line)
+        y -= line_height
+
+    c.save()
+    return buf.getvalue()
+
+
+# -----------------------------
+# UI
+# -----------------------------
+st.set_page_config(page_title="Inventaire — Nettoyage & Fusion", layout="wide")
+st.title("Inventaire — Nettoyage & fusion (prefixes ignorés)")
+
+uploaded = st.file_uploader("Upload inventory file (CSV / Excel / PDF)", type=["csv", "xlsx", "xls", "pdf"])
 
 with st.sidebar:
-    st.header("Settings")
+    st.header("Règles")
     excluded_text = st.text_input(
-        "Prefixes to exclude (comma-separated)",
+        "Prefixes à ignorer (séparés par virgules)",
         value=",".join(sorted(DEFAULT_EXCLUDED_WORDS)),
-        help="Example: APO,SANDOZ,TEVA"
+        help="Ex: APO,SANDOZ,TEVA"
     )
     excluded_words = {w.strip().upper() for w in excluded_text.split(",") if w.strip()}
+
+    st.divider()
+    st.header("Exports")
+    export_pdf = st.checkbox("Générer aussi un PDF", value=False)
+    if export_pdf and not REPORTLAB_OK:
+        st.warning("PDF export needs reportlab. Add 'reportlab' to requirements.txt.")
 
 if not uploaded:
     st.info("Upload a file to begin.")
@@ -237,68 +317,38 @@ except Exception as e:
 
 st.success(note)
 
-st.subheader("Preview of uploaded data")
-st.dataframe(df_raw.head(40), use_container_width=True)
+# Auto pick columns
+med_col_idx, amt_col_idx = auto_pick_columns(df_raw)
+st.caption(f"Auto-detected columns → Medication: {med_col_idx} | Amount: {amt_col_idx}")
 
-st.subheader("Pick columns")
-col_count = df_raw.shape[1]
+# Run aggregation
+out, parsed, skipped = aggregate_inventory(df_raw, med_col_idx, amt_col_idx, excluded_words)
 
-default_med_col = 1 if col_count > 1 else 0
-default_amt_col = 2 if col_count > 2 else min(1, col_count - 1)
+st.subheader("Inventaire réorganisé (prefixes supprimés + totaux)")
+st.write(f"Parsed rows: **{parsed}** — Skipped rows: **{skipped}**")
+st.dataframe(out, use_container_width=True)
 
-med_col_idx = st.number_input(
-    "Medication info column index (0-based)",
-    min_value=0,
-    max_value=max(0, col_count - 1),
-    value=default_med_col,
-    step=1,
+# Excel download
+excel_buf = io.BytesIO()
+with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
+    out.to_excel(writer, index=False, sheet_name="Inventaire")
+
+st.download_button(
+    "Télécharger Excel (.xlsx)",
+    data=excel_buf.getvalue(),
+    file_name="inventaire_reorganise.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
 
-amt_col_idx = st.number_input(
-    "Amount column index (0-based)",
-    min_value=0,
-    max_value=max(0, col_count - 1),
-    value=default_amt_col,
-    step=1,
-)
-
-if med_col_idx == amt_col_idx:
-    st.warning("Medication column and Amount column are the same. Pick two different columns.")
-
-run = st.button("Aggregate", type="primary")
-
-if run:
+# PDF download (optional)
+if export_pdf:
     try:
-        out, parsed, skipped = aggregate_inventory(
-            df_raw,
-            int(med_col_idx),
-            int(amt_col_idx),
-            excluded_words
+        pdf_bytes = dataframe_to_simple_pdf(out, title="Inventaire réorganisé (prefixes ignorés)")
+        st.download_button(
+            "Télécharger PDF (.pdf)",
+            data=pdf_bytes,
+            file_name="inventaire_reorganise.pdf",
+            mime="application/pdf",
         )
     except Exception as e:
-        st.error(f"Aggregation failed: {e}")
-        st.stop()
-
-    st.subheader("Result")
-    st.write(f"Parsed rows: **{parsed}** — Skipped rows: **{skipped}**")
-    st.dataframe(out, use_container_width=True)
-
-    st.subheader("Download")
-    csv_bytes = out.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download CSV",
-        data=csv_bytes,
-        file_name="med_aggregated.csv",
-        mime="text/csv",
-    )
-
-    excel_buf = io.BytesIO()
-    with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
-        out.to_excel(writer, index=False, sheet_name="Aggregated")
-
-    st.download_button(
-        "Download Excel",
-        data=excel_buf.getvalue(),
-        file_name="med_aggregated.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+        st.error(str(e))
