@@ -1,6 +1,11 @@
 # inventaire.py
-# pip install streamlit pandas openpyxl pdfplumber pdfminer.six
-# Optional PDF export: pip install reportlab
+# Install:
+#   pip install streamlit pandas openpyxl pdfplumber pdfminer.six
+# Optional PDF export:
+#   pip install reportlab
+#
+# Run:
+#   streamlit run inventaire.py
 
 import io
 import re
@@ -27,12 +32,12 @@ except Exception:
 
 
 # -----------------------------
-# Seed prefixes (Canada-typical, not “APO-only”)
-# This is a STARTER set; the app also learns from YOUR file automatically.
+# Vendor words to remove (anywhere in text)
+# Add more if your export contains other suppliers/wholesalers.
 # -----------------------------
-CANADA_PREFIX_SEED = {
-    "AA", "APO", "PMS", "RATIO", "TEVA", "SANDOZ", "AURO", "JAMP", "MINT",
-    "MYLAN", "TARO", "ACT", "ACC", "NOVO", "RAN", "PHL", "BIO", "OPUS",
+DEFAULT_VENDOR_TRASH = {
+    "MCKESSON", "MC KESSON", "MCK", "MCSON", "MCKESS",
+    "PHARMA PLUS", "PHARMAPLUS", "PHARMA+", "PHARMA-PLUS",
 }
 
 
@@ -41,14 +46,6 @@ CANADA_PREFIX_SEED = {
 # -----------------------------
 def normalise_space(s: str) -> str:
     return re.sub(r"\s+", " ", str(s)).strip()
-
-
-def looks_numeric_cell(x) -> bool:
-    s = str(x).strip()
-    if not s:
-        return False
-    s = s.replace(",", ".")
-    return bool(re.search(r"-?\d+(?:\.\d+)?", s))
 
 
 def to_float_or_none(x) -> Optional[float]:
@@ -67,6 +64,33 @@ def to_float_or_none(x) -> Optional[float]:
         return None
 
 
+def looks_numeric_cell(x) -> bool:
+    return to_float_or_none(x) is not None
+
+
+def remove_vendor_words(text: str, vendor_words: Set[str]) -> str:
+    """
+    Remove vendor tokens/phrases anywhere (whole words, case-insensitive).
+    Handles multi-word phrases like "PHARMA PLUS".
+    """
+    s = normalise_space(text)
+    if not s:
+        return s
+
+    # Sort by length so multi-word phrases removed first
+    for w in sorted(vendor_words, key=len, reverse=True):
+        w_norm = normalise_space(w)
+        if not w_norm:
+            continue
+        # whole word / whole phrase boundaries
+        s = re.sub(rf"(?i)\b{re.escape(w_norm)}\b", " ", s)
+
+    return normalise_space(s)
+
+
+# -----------------------------
+# Read files
+# -----------------------------
 def read_pdf_to_dataframe(uploaded_file) -> pd.DataFrame:
     if not PDFPLUMBER_OK:
         raise RuntimeError("PDF support not installed. Add pdfplumber to requirements.txt.")
@@ -76,8 +100,8 @@ def read_pdf_to_dataframe(uploaded_file) -> pd.DataFrame:
 
     with pdfplumber.open(uploaded_file) as pdf:
         for page in pdf.pages:
-            for table in page.extract_tables() or []:
-                for row in table or []:
+            for table in (page.extract_tables() or []):
+                for row in (table or []):
                     if row is None:
                         continue
                     row = list(row)
@@ -96,8 +120,10 @@ def read_uploaded_file(uploaded_file) -> Tuple[pd.DataFrame, str]:
 
     if name.endswith(".csv"):
         return pd.read_csv(uploaded_file), "Loaded CSV"
+
     if name.endswith(".xlsx") or name.endswith(".xls"):
         return pd.read_excel(uploaded_file), "Loaded Excel"
+
     if name.endswith(".pdf"):
         return read_pdf_to_dataframe(uploaded_file), "Loaded PDF (via pdfplumber)"
 
@@ -112,7 +138,7 @@ def detect_quantity_column(df: pd.DataFrame) -> int:
     best_score = -1.0
 
     for i in range(df.shape[1]):
-        col = df.iloc[:, i].dropna().head(400)
+        col = df.iloc[:, i].dropna().head(600)
         if len(col) == 0:
             continue
         hits = sum(1 for v in col if to_float_or_none(v) is not None)
@@ -129,7 +155,7 @@ def detect_text_columns(df: pd.DataFrame, qty_idx: int) -> List[int]:
     for i in range(df.shape[1]):
         if i == qty_idx:
             continue
-        sample = df.iloc[:, i].dropna().astype(str).head(250)
+        sample = df.iloc[:, i].dropna().astype(str).head(350)
         if len(sample) == 0:
             continue
         avg_len = sum(len(s.strip()) for s in sample) / max(1, len(sample))
@@ -154,83 +180,116 @@ def build_description(row: pd.Series, text_cols: List[int]) -> str:
 
 
 # -----------------------------
-# Prefix learning + stripping
+# Prefix learning (from YOUR inventory)
 # -----------------------------
-def guess_prefixes_from_descriptions(desc_series: pd.Series, min_count: int = 3) -> Set[str]:
+def learn_prefixes_from_file(descriptions: pd.Series, min_count: int = 2) -> Set[str]:
     """
-    Learns candidate prefixes from your file.
-    Rules:
-      - take first token OR token before '-' if present
-      - alphabetic only
-      - short-ish (1–8 chars)
-      - appears >= min_count
+    Learns prefixes used in your dataset. Captures:
+      - Hyphen prefixes: "AA-FLUOXETINE" => AA
+      - Space prefixes used frequently: "PMS FLUOXETINE" => PMS
+    We keep short alphabetic tokens only.
     """
-    counts: Dict[str, int] = {}
+    hyphen_counts: Dict[str, int] = {}
+    first_token_counts: Dict[str, int] = {}
 
-    for raw in desc_series.dropna().astype(str).head(5000):
+    for raw in descriptions.dropna().astype(str).head(10000):
         s = normalise_space(raw)
         if not s:
             continue
 
-        # token before '-' is strong signal (e.g., "PMS-FLUOXETINE")
-        m = re.match(r"^([A-Za-z]{1,8})\s*-\s*(.+)$", s)
+        # Hyphen prefix signal
+        m = re.match(r"^([A-Za-z]{1,10})\s*-\s*(.+)$", s)
         if m:
             p = m.group(1).upper()
-        else:
-            p = s.split()[0].upper()
+            if p.isalpha():
+                hyphen_counts[p] = hyphen_counts.get(p, 0) + 1
 
-        if p.isalpha() and 1 <= len(p) <= 8:
-            counts[p] = counts.get(p, 0) + 1
+        # First token signal
+        first = s.split()[0].upper()
+        if 1 <= len(first) <= 10 and first.isalpha():
+            first_token_counts[first] = first_token_counts.get(first, 0) + 1
 
-    return {p for p, c in counts.items() if c >= min_count}
+    prefixes = set()
+
+    # Always accept hyphen prefixes that appear enough
+    for p, c in hyphen_counts.items():
+        if c >= 1:  # even 1 is fine: hyphen form is very indicative
+            prefixes.add(p)
+
+    # Accept frequent first tokens as prefixes too (space-form like "PMS FLUOXETINE")
+    for p, c in first_token_counts.items():
+        if c >= min_count:
+            prefixes.add(p)
+
+    return prefixes
 
 
-def split_prefix_and_core(desc: str, known_prefixes: Set[str]) -> Tuple[Optional[str], str]:
+def split_prefix_and_core(desc: str, learned_prefixes: Set[str]) -> Tuple[Optional[str], str]:
     """
-    Accepts:
-      - "PMS-FLUOXETINE ..."  -> ("PMS", "FLUOXETINE ...")
-      - "PMS FLUOXETINE ..."  -> ("PMS", "FLUOXETINE ...")
-      - "aa-fluoxetine"       -> ("AA", "FLUOXETINE")
-    Only strips if prefix is in known_prefixes.
+    Strip prefix in two cases:
+      1) hyphen form ALWAYS: "AA-FLUOXETINE" -> prefix AA, core FLUOXETINE
+      2) space form ONLY if prefix is learned: "PMS FLUOXETINE" -> prefix PMS, core FLUOXETINE
     """
     s = normalise_space(desc)
     if not s:
         return None, s
 
-    # hyphen form
-    m = re.match(r"^([A-Za-z]{1,8})\s*-\s*(.+)$", s)
+    # Hyphen form: always strip if it looks like a prefix token (letters, short)
+    m = re.match(r"^([A-Za-z]{1,10})\s*-\s*(.+)$", s)
     if m:
         p = m.group(1).upper()
-        rest = m.group(2)
-        if p in known_prefixes:
-            return p, normalise_space(rest)
+        rest = normalise_space(m.group(2))
+        if p.isalpha() and rest:
+            return p, rest
 
-    # space form
-    first = s.split()[0].upper()
-    if first in known_prefixes:
-        rest = " ".join(s.split()[1:])
-        return first, normalise_space(rest)
+    # Space form: strip only if learned
+    parts = s.split()
+    if len(parts) >= 2:
+        first = parts[0].upper()
+        if first in learned_prefixes:
+            return first, normalise_space(" ".join(parts[1:]))
 
     return None, s
 
 
+def is_real_med_name(text: str) -> bool:
+    """
+    Filters out garbage like "0.4 mL", "1500 mL", "Plaquette", etc.
+    Heuristic: must contain letters AND at least one of:
+      - length >= 8, or
+      - contains a digit AND letters (often strength/form)
+    """
+    s = normalise_space(text)
+    if not s:
+        return False
+
+    has_letters = bool(re.search(r"[A-Za-zÀ-ÿ]", s))
+    if not has_letters:
+        return False
+
+    if len(s) >= 8:
+        return True
+
+    has_digit = bool(re.search(r"\d", s))
+    return has_digit
+
+
 # -----------------------------
-# Aggregate with brand/prefix list
+# Aggregation (core + totals + brand list)
 # -----------------------------
-def aggregate_inventory_with_brands(df: pd.DataFrame) -> Tuple[pd.DataFrame, int, int, int, Set[str]]:
+def aggregate_inventory(df: pd.DataFrame, vendor_words: Set[str], prefix_min_count: int) -> Tuple[pd.DataFrame, int, int, int, Set[str]]:
     qty_idx = detect_quantity_column(df)
     text_cols = detect_text_columns(df, qty_idx)
 
-    # Build quick descriptions to learn prefixes from THIS file
-    tmp_desc = []
+    # Build descriptions to learn prefixes from the actual file
+    desc_list = []
     for _, row in df.iterrows():
         d = build_description(row, text_cols)
+        d = remove_vendor_words(d, vendor_words)
         if d:
-            tmp_desc.append(d)
-    desc_series = pd.Series(tmp_desc)
+            desc_list.append(d)
 
-    learned = guess_prefixes_from_descriptions(desc_series, min_count=3)
-    known_prefixes = set(CANADA_PREFIX_SEED) | learned
+    learned_prefixes = learn_prefixes_from_file(pd.Series(desc_list), min_count=prefix_min_count)
 
     totals: Dict[str, float] = {}
     brands: Dict[str, Set[str]] = {}
@@ -245,14 +304,15 @@ def aggregate_inventory_with_brands(df: pd.DataFrame) -> Tuple[pd.DataFrame, int
             continue
 
         desc = build_description(row, text_cols)
+        desc = remove_vendor_words(desc, vendor_words)
+
         if not desc:
             skipped += 1
             continue
 
-        prefix, core = split_prefix_and_core(desc, known_prefixes)
+        prefix, core = split_prefix_and_core(desc, learned_prefixes)
 
-        # Filter out garbage rows like only units/packaging fragments
-        if not re.search(r"[A-Za-zÀ-ÿ]", core) or len(core) < 6:
+        if not is_real_med_name(core):
             skipped += 1
             continue
 
@@ -265,17 +325,19 @@ def aggregate_inventory_with_brands(df: pd.DataFrame) -> Tuple[pd.DataFrame, int
 
     out = pd.DataFrame(
         {
-            "Médicament (nom regroupé)": list(totals.keys()),
+            "Médicament (regroupé)": list(totals.keys()),
             "Quantité totale": [totals[k] for k in totals.keys()],
-            "Marques / Préfixes trouvés": [", ".join(sorted(brands.get(k, set()))) for k in totals.keys()],
+            "Préfixes / Marques trouvés": [", ".join(sorted(brands.get(k, set()))) for k in totals.keys()],
         }
-    ).sort_values("Médicament (nom regroupé)").reset_index(drop=True)
+    ).sort_values("Médicament (regroupé)").reset_index(drop=True)
 
-    return out, qty_idx, parsed, skipped, known_prefixes
+    out["Préfixes / Marques trouvés"] = out["Préfixes / Marques trouvés"].fillna("")
+
+    return out, qty_idx, parsed, skipped, learned_prefixes
 
 
 # -----------------------------
-# PDF export (optional)
+# Optional PDF export
 # -----------------------------
 def dataframe_to_simple_pdf(df: pd.DataFrame, title: str) -> bytes:
     if not REPORTLAB_OK:
@@ -295,10 +357,10 @@ def dataframe_to_simple_pdf(df: pd.DataFrame, title: str) -> bytes:
     c.setFont("Helvetica", 9)
     lh = 11
 
-    headers = ["Médicament (nom regroupé)", "Quantité totale", "Marques / Préfixes trouvés"]
+    headers = ["Médicament (regroupé)", "Quantité totale", "Préfixes / Marques trouvés"]
     c.drawString(x, y, f"{headers[0][:55]:55}  {headers[1]:>12}  {headers[2]}")
     y -= lh
-    c.drawString(x, y, "-" * 110)
+    c.drawString(x, y, "-" * 115)
     y -= lh
 
     for _, r in df.iterrows():
@@ -323,15 +385,30 @@ def dataframe_to_simple_pdf(df: pd.DataFrame, title: str) -> bytes:
 # Streamlit UI
 # -----------------------------
 st.set_page_config(page_title="Inventaire — Regroupement (préfixes)", layout="wide")
-st.title("Inventaire — Regroupement des génériques (préfixes → même médicament)")
+st.title("Inventaire — Regroupement (tous préfixes) + vendors supprimés")
 
 uploaded = st.file_uploader("Upload inventory file (CSV / Excel / PDF)", type=["csv", "xlsx", "xls", "pdf"])
 
 with st.sidebar:
-    st.header("Contrôles (optionnels)")
-    extra_add = st.text_input("Ajouter des préfixes (comma-separated)", value="")
-    extra_remove = st.text_input("Forcer à NE PAS traiter comme préfixe (comma-separated)", value="")
+    st.header("Vendors à supprimer (McKesson, Pharma Plus, etc.)")
+    vendor_text = st.text_area(
+        "Une entrée par ligne",
+        value="\n".join(sorted(DEFAULT_VENDOR_TRASH)),
+        height=140,
+    )
+    vendor_words = {normalise_space(v).upper() for v in vendor_text.splitlines() if normalise_space(v)}
 
+    st.divider()
+    st.header("Détection des préfixes")
+    prefix_min_count = st.slider(
+        "Un token doit apparaître au moins N fois pour être traité comme préfixe (space-form)",
+        min_value=1,
+        max_value=20,
+        value=2,
+        help="Hyphen-form (AA-XXX) is always stripped. Space-form (PMS XXX) needs frequency to avoid false positives.",
+    )
+
+    st.divider()
     export_pdf = st.checkbox("Générer aussi un PDF", value=False)
     if export_pdf and not REPORTLAB_OK:
         st.warning("PDF export needs reportlab. Add 'reportlab' to requirements.txt.")
@@ -350,54 +427,13 @@ st.success(note)
 st.subheader("Preview")
 st.dataframe(df_raw.head(40), use_container_width=True)
 
-out, qty_idx, parsed, skipped, known_prefixes = aggregate_inventory_with_brands(df_raw)
-
-# Apply optional user tweaks AFTER detection
-add_set = {p.strip().upper() for p in extra_add.split(",") if p.strip()}
-remove_set = {p.strip().upper() for p in extra_remove.split(",") if p.strip()}
-
-if add_set or remove_set:
-    # Re-run aggregation with modified known_prefixes
-    # (quick re-run: we just hack known_prefixes and recompute)
-    # For simplicity: rebuild with the adjusted set by calling a modified version inline.
-    # ---- minimal recompute ----
-    qty_idx = detect_quantity_column(df_raw)
-    text_cols = detect_text_columns(df_raw, qty_idx)
-    adjusted = (known_prefixes | add_set) - remove_set
-
-    totals, brands = {}, {}
-    parsed, skipped = 0, 0
-    for _, row in df_raw.iterrows():
-        qty = to_float_or_none(row.iloc[qty_idx])
-        if qty is None:
-            skipped += 1
-            continue
-        desc = build_description(row, text_cols)
-        if not desc:
-            skipped += 1
-            continue
-        prefix, core = split_prefix_and_core(desc, adjusted)
-        if not re.search(r"[A-Za-zÀ-ÿ]", core) or len(core) < 6:
-            skipped += 1
-            continue
-        totals[core] = totals.get(core, 0.0) + float(qty)
-        if prefix:
-            brands.setdefault(core, set()).add(prefix)
-        parsed += 1
-
-    out = pd.DataFrame(
-        {
-            "Médicament (nom regroupé)": list(totals.keys()),
-            "Quantité totale": [totals[k] for k in totals.keys()],
-            "Marques / Préfixes trouvés": [", ".join(sorted(brands.get(k, set()))) for k in totals.keys()],
-        }
-    ).sort_values("Médicament (nom regroupé)").reset_index(drop=True)
+out, qty_idx, parsed, skipped, learned_prefixes = aggregate_inventory(df_raw, vendor_words, prefix_min_count)
 
 st.caption(f"Auto-detected quantity column: {qty_idx}")
 st.write(f"Parsed rows: **{parsed}** — Skipped rows: **{skipped}**")
 
-with st.expander("Préfixes détectés / utilisés (debug)"):
-    st.write(", ".join(sorted(known_prefixes))[:2000])
+with st.expander("Préfixes détectés (debug)"):
+    st.write(", ".join(sorted(learned_prefixes))[:4000])
 
 st.subheader("Résultat (regroupé)")
 st.dataframe(out, use_container_width=True)
@@ -417,7 +453,7 @@ st.download_button(
 # Optional PDF download
 if export_pdf:
     try:
-        pdf_bytes = dataframe_to_simple_pdf(out, "Inventaire regroupé (préfixes → même médicament)")
+        pdf_bytes = dataframe_to_simple_pdf(out, "Inventaire regroupé (vendors supprimés, préfixes fusionnés)")
         st.download_button(
             "Télécharger PDF (.pdf)",
             data=pdf_bytes,
