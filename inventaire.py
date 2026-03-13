@@ -1,15 +1,9 @@
 # inventaire.py
-# Simple and safer version:
-# - Upload CSV / Excel / PDF
-# - YOU choose the stock quantity column manually
-# - App builds a medication description from text columns
-# - Removes vendor names from the description
-# - Ignores generic prefixes at the start (APO, PMS, AURO, etc.)
-# - Extracts the molecule name
-# - Sums the stock quantity by molecule
+# Upload inventory -> auto-group by medication -> ignore prefixes -> total stock units
 #
 # Install:
 #   pip install streamlit pandas openpyxl pdfplumber pdfminer.six
+#
 # Optional PDF export:
 #   pip install reportlab
 #
@@ -18,8 +12,8 @@
 
 import io
 import re
-from collections import defaultdict, Counter
-from typing import List, Optional, Tuple, Dict, Set
+from collections import defaultdict
+from typing import Optional, Tuple, List
 
 import pandas as pd
 import streamlit as st
@@ -42,80 +36,25 @@ except Exception:
 
 
 # -----------------------------
-# Defaults
+# Prefixes to ignore at the start
 # -----------------------------
-DEFAULT_VENDORS = [
-    "McKesson",
-    "Pharma Plus",
-    "PharmaPlus",
-    "Pharma+",
-]
-
-# Prefixes to ignore at the START of the drug name
-DEFAULT_PREFIXES = [
-    "APO", "PMS", "RATIO", "SANDOZ", "TEVA", "AURO", "JAMP", "MINT",
+IGNORED_PREFIXES = {
+    "AA", "APO", "PMS", "RATIO", "SANDOZ", "TEVA", "AURO", "JAMP", "MINT",
     "MYLAN", "TARO", "ACT", "NOVO", "BIO", "OPUS", "RAN", "MAR",
-    "AA", "ACC", "ACH", "AG", "BGP",
-]
+    "ACC", "ACH", "AG", "BGP"
+}
 
-# Words we do NOT want to become molecules
-STOPWORDS = {
-    # company / vendor / generic filler
-    "PHARMA", "PHARMACEUTICAL", "PHARMACEUTICALS", "PHARMACEUTICA",
-    "LAB", "LABS", "LABORATORIES", "INC", "LTD", "LIMITED", "CORP",
-    "CORPORATION", "CANADA", "HEALTH", "TRADING", "GROUP", "COMPANY",
-    "MCKESSON", "PHARMAPLUS", "PLUS",
-
-    # forms / packaging / units
+# Tokens that usually mean "stop medication name here"
+STOP_TOKENS = {
+    "MG", "MCG", "G", "KG", "ML", "L", "IU", "%",
     "TAB", "TABS", "TABLET", "TABLETS",
     "CAP", "CAPS", "CAPSULE", "CAPSULES",
     "COMP", "COMPRIME", "COMPRIMES", "COMPRIMÉ", "COMPRIMÉS",
-    "SUSP", "SUSPENSION", "SOLUTION", "SYRUP", "SIROP",
-    "CREME", "CRÈME", "POMMADE", "GEL", "LOTION",
-    "INJ", "INJECTION", "VIAL", "VIALS", "AMPOULE", "PATCH", "SPRAY",
-    "DROPS", "GOUTTES", "BOTTLE", "BOTTLES", "BOX", "BOXES", "PACK", "PACKS",
-    "PLAQUETTE", "BANDELETTE", "STYLO", "PEN", "PENS",
-
-    # release / dosage markers
-    "XR", "SR", "ER", "CR", "DR", "ODT",
-
-    # measurement units
-    "MG", "MCG", "G", "KG", "ML", "L", "IU", "U", "%",
-
-    # annoying non-molecule starts
-    "ACIDE", "ROUGE", "MENTHE",
-}
-
-UNIT_WORDS = {
-    "TAB": "tablets",
-    "TABS": "tablets",
-    "TABLET": "tablets",
-    "TABLETS": "tablets",
-    "COMP": "tablets",
-    "COMPRIME": "tablets",
-    "COMPRIMES": "tablets",
-    "COMPRIMÉ": "tablets",
-    "COMPRIMÉS": "tablets",
-
-    "CAP": "capsules",
-    "CAPS": "capsules",
-    "CAPSULE": "capsules",
-    "CAPSULES": "capsules",
-
-    "BOTTLE": "bottles",
-    "BOTTLES": "bottles",
-    "VIAL": "vials",
-    "VIALS": "vials",
-    "BOX": "boxes",
-    "BOXES": "boxes",
-    "PACK": "packs",
-    "PACKS": "packs",
-    "PEN": "pens",
-    "PENS": "pens",
-    "STYLO": "pens",
-
-    "ML": "mL",
-    "L": "L",
+    "DOSE", "DOSES",
+    "INH", "INHALATEUR", "SPRAY", "POUDRE", "SUSP", "SUSPENSION",
+    "SOLUTION", "SYRUP", "SIROP", "GEL", "CREME", "CRÈME",
+    "XR", "SR", "ER", "CR", "DR", "CD",
+    "PLAQUETTE", "ENTERIC", "ENT", "ENT."
 }
 
 
@@ -126,38 +65,53 @@ def norm(s: str) -> str:
     return re.sub(r"\s+", " ", str(s)).strip()
 
 
-def to_float_or_none(x) -> Optional[float]:
-    if x is None:
-        return None
-    s = str(x).strip()
-    if not s:
-        return None
-    s = s.replace(",", ".")
+def to_float_or_zero(x) -> float:
+    if pd.isna(x):
+        return 0.0
+    s = str(x).strip().replace(",", ".")
     m = re.search(r"-?\d+(?:\.\d+)?", s)
     if not m:
-        return None
+        return 0.0
     try:
         return float(m.group(0))
     except Exception:
-        return None
-
-
-def is_mostly_numeric(series: pd.Series, sample_n: int = 300) -> float:
-    vals = series.dropna().head(sample_n)
-    if len(vals) == 0:
         return 0.0
-    hits = sum(1 for v in vals if to_float_or_none(v) is not None)
-    return hits / len(vals)
+
+
+def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [norm(str(c)).replace("\n", " ") for c in df.columns]
+    return df
 
 
 # -----------------------------
-# File reading
+# Read files
 # -----------------------------
-def read_pdf_to_df(uploaded_file) -> pd.DataFrame:
+def read_csv_inventory(uploaded_file) -> pd.DataFrame:
+    # Your CSV export has the real header on row 2 (skip first row)
+    df = pd.read_csv(uploaded_file, skiprows=1)
+    df = clean_columns(df)
+    return df
+
+
+def read_excel_inventory(uploaded_file) -> pd.DataFrame:
+    # Try normal read first
+    df = pd.read_excel(uploaded_file)
+    df = clean_columns(df)
+
+    # If headers are bad, retry like the CSV structure
+    if "Produit" not in df.columns and "Qté servie" not in df.columns:
+        df = pd.read_excel(uploaded_file, skiprows=1)
+        df = clean_columns(df)
+
+    return df
+
+
+def read_pdf_inventory(uploaded_file) -> pd.DataFrame:
     if not PDFPLUMBER_OK:
         raise RuntimeError("PDF support not installed. Add pdfplumber to requirements.txt.")
 
-    rows: List[List[object]] = []
+    rows = []
     max_cols = 0
 
     with pdfplumber.open(uploaded_file) as pdf:
@@ -171,238 +125,201 @@ def read_pdf_to_df(uploaded_file) -> pd.DataFrame:
                     rows.append(row)
 
     if not rows:
-        raise RuntimeError("No tables detected in PDF. If the PDF is scanned, you need OCR.")
+        raise RuntimeError("No tables detected in PDF.")
 
-    padded = [r + [None] * (max_cols - len(r)) for r in rows]
-    return pd.DataFrame(padded)
+    rows = [r + [None] * (max_cols - len(r)) for r in rows]
+    raw = pd.DataFrame(rows)
+
+    # Try to use first real row as header if it contains Produit / Qté servie
+    header_row_idx = None
+    for i in range(min(10, len(raw))):
+        joined = " | ".join([norm(x).replace("\n", " ") for x in raw.iloc[i].fillna("").tolist()])
+        if "Produit" in joined and "Qté servie" in joined:
+            header_row_idx = i
+            break
+
+    if header_row_idx is None:
+        raise RuntimeError("Could not detect inventory headers in PDF.")
+
+    header = [norm(x).replace("\n", " ") for x in raw.iloc[header_row_idx].tolist()]
+    df = raw.iloc[header_row_idx + 1:].copy()
+    df.columns = header
+    df = clean_columns(df)
+
+    return df
 
 
 def read_uploaded_file(uploaded_file) -> Tuple[pd.DataFrame, str]:
     name = uploaded_file.name.lower()
 
     if name.endswith(".csv"):
-        return pd.read_csv(uploaded_file), "Loaded CSV"
+        return read_csv_inventory(uploaded_file), "Loaded CSV"
 
     if name.endswith(".xlsx") or name.endswith(".xls"):
-        return pd.read_excel(uploaded_file), "Loaded Excel"
+        return read_excel_inventory(uploaded_file), "Loaded Excel"
 
     if name.endswith(".pdf"):
-        return read_pdf_to_df(uploaded_file), "Loaded PDF (via pdfplumber)"
+        return read_pdf_inventory(uploaded_file), "Loaded PDF"
 
-    raise RuntimeError("Unsupported file type. Upload CSV, XLSX, or PDF.")
-
-
-# -----------------------------
-# Column helpers
-# -----------------------------
-def guess_quantity_columns(df: pd.DataFrame) -> List[Tuple[float, int]]:
-    scored = []
-    for i in range(df.shape[1]):
-        score = is_mostly_numeric(df.iloc[:, i])
-        scored.append((score, i))
-    scored.sort(reverse=True)
-    return scored
-
-
-def guess_text_columns(df: pd.DataFrame, qty_idx: int) -> List[int]:
-    candidates = []
-    for i in range(df.shape[1]):
-        if i == qty_idx:
-            continue
-        sample = df.iloc[:, i].dropna().astype(str).head(400)
-        if len(sample) == 0:
-            continue
-        avg_len = sum(len(v.strip()) for v in sample) / len(sample)
-        non_num_frac = sum(1 for v in sample if to_float_or_none(v) is None) / len(sample)
-        score = avg_len * non_num_frac
-        candidates.append((score, i))
-    candidates.sort(reverse=True)
-    return [i for _, i in candidates[:6]]
-
-
-def build_description(row: pd.Series, text_cols: List[int]) -> str:
-    parts = []
-    for i in text_cols:
-        val = row.iloc[i]
-        if val is None:
-            continue
-        s = norm(val)
-        if not s:
-            continue
-        parts.append(s)
-    return norm(" ".join(parts))
+    raise RuntimeError("Unsupported file type. Upload CSV, XLSX, XLS, or PDF.")
 
 
 # -----------------------------
-# Cleaning logic
+# Medication parsing
 # -----------------------------
-def remove_vendors_and_manufacturer(text: str, vendors: List[str]) -> Tuple[str, Set[str]]:
+def strip_prefix(product_name: str) -> Tuple[Optional[str], str]:
     """
-    Example:
-    'APOTEX McKesson APO FLUOXETINE 20 MG CAPS'
-    -> remove everything before vendor + vendor itself
-    -> 'APO FLUOXETINE 20 MG CAPS'
-    """
-    s = norm(text)
-    found_vendors = set()
-
-    if not s:
-        return s, found_vendors
-
-    earliest_match = None
-    chosen_vendor = None
-
-    for v in sorted({norm(x) for x in vendors if norm(x)}, key=len, reverse=True):
-        m = re.search(rf"(?i)\b{re.escape(v)}\b", s)
-        if m:
-            found_vendors.add(v.upper())
-            if earliest_match is None or m.start() < earliest_match:
-                earliest_match = m.start()
-                chosen_vendor = v
-
-    if earliest_match is not None and chosen_vendor is not None:
-        s = norm(s[earliest_match + len(chosen_vendor):])
-
-    for v in sorted({norm(x) for x in vendors if norm(x)}, key=len, reverse=True):
-        if re.search(rf"(?i)\b{re.escape(v)}\b", s):
-            found_vendors.add(v.upper())
-            s = re.sub(rf"(?i)\b{re.escape(v)}\b", " ", s)
-
-    return norm(s), found_vendors
-
-
-def strip_generic_prefix(text: str, prefixes: Set[str]) -> Tuple[Optional[str], str]:
-    """
-    Only strips prefix at the START.
     Examples:
-    APO-FLUOXETINE -> FLUOXETINE
-    APO FLUOXETINE -> FLUOXETINE
+      APO FLUOXETINE 20MG COMPRIME -> FLUOXETINE ...
+      APO-FLUOXETINE 20MG -> FLUOXETINE ...
+      AA LEVOCARB CR 200+50MG -> LEVOCARB ...
     """
-    s = norm(text)
+    s = norm(product_name).upper().replace("\n", " ")
     if not s:
         return None, s
 
-    m = re.match(r"^([A-Za-z]{1,15})\s*-\s*(.+)$", s)
+    # hyphen form
+    m = re.match(r"^([A-Z]{1,15})\s*-\s*(.+)$", s)
     if m:
-        pfx = m.group(1).upper()
+        prefix = m.group(1).upper()
         rest = norm(m.group(2))
-        if pfx in prefixes:
-            return pfx, rest
+        if prefix in IGNORED_PREFIXES:
+            return prefix, rest
 
+    # space form
     parts = s.split()
     if len(parts) >= 2:
         first = parts[0].upper()
-        if first in prefixes:
+        if first in IGNORED_PREFIXES:
             return first, norm(" ".join(parts[1:]))
 
     return None, s
 
 
-def detect_probable_unit(text: str) -> str:
-    s = norm(text).upper()
-    for raw, label in UNIT_WORDS.items():
-        if re.search(rf"\b{re.escape(raw)}\b", s):
-            return label
+def extract_medication_key(product_name: str) -> str:
+    """
+    Goal: get a clean medication grouping key from Produit.
+    We stop once we hit dosage/form/package words.
+    """
+    _, cleaned = strip_prefix(product_name)
+    cleaned = norm(cleaned)
+
+    tokens = []
+    for raw_tok in cleaned.split():
+        tok = raw_tok.strip(" ,;()[]{}:+-/").upper()
+
+        if not tok:
+            continue
+
+        # stop at anything dosage-like or format-like
+        if tok in STOP_TOKENS:
+            break
+        if re.search(r"\d", tok):
+            break
+
+        tokens.append(tok)
+
+    # fallback: if nothing survived, use first alphabetic token after prefix stripping
+    if not tokens:
+        for raw_tok in cleaned.split():
+            tok = raw_tok.strip(" ,;()[]{}:+-/").upper()
+            if tok and re.search(r"[A-Z]", tok) and tok not in STOP_TOKENS:
+                return tok
+        return ""
+
+    return " ".join(tokens)
+
+
+def detect_probable_unit(product_name: str, format_value: str) -> str:
+    text = f"{norm(product_name)} {norm(format_value)}".upper()
+
+    if re.search(r"\b(DOSE|DOSES)\b", text):
+        return "doses"
+    if re.search(r"\b(CAP|CAPS|CAPSULE|CAPSULES)\b", text):
+        return "capsules"
+    if re.search(r"\b(TAB|TABS|TABLET|TABLETS|COMP|COMPRIME|COMPRIMES|COMPRIMÉ|COMPRIMÉS)\b", text):
+        return "pills"
+    if re.search(r"\b(ML|L)\b", text):
+        return "mL"
     return "units"
 
 
-def extract_molecule(text: str) -> str:
-    """
-    Pull first real molecule-like token from the cleaned description.
-    We avoid short junk, units, vendor/company terms, and numeric tokens.
-    """
-    s = norm(text).upper()
-    if not s:
-        return ""
-
-    tokens = [t.strip(" ,;()[]{}:+-/") for t in s.split()]
-
-    for tok in tokens:
-        if not tok:
-            continue
-        if tok in STOPWORDS:
-            continue
-        if re.search(r"\d", tok):
-            continue
-        if len(tok) < 4:
-            continue
-        if not re.search(r"[A-ZÀ-Ý]", tok):
-            continue
-        return tok
-
-    return ""
-
-
 # -----------------------------
-# Aggregation
+# Inventory logic
 # -----------------------------
-def aggregate_inventory(
-    df: pd.DataFrame,
-    qty_idx: int,
-    text_cols: List[int],
-    vendors: List[str],
-    prefixes: Set[str],
-):
-    totals: Dict[str, float] = defaultdict(float)
-    unit_labels: Dict[str, List[str]] = defaultdict(list)
-    sample_desc: Dict[str, str] = {}
-    prefix_seen: Dict[str, Set[str]] = defaultdict(set)
-    vendor_seen: Dict[str, Set[str]] = defaultdict(set)
+def normalise_inventory_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
 
-    parsed = 0
-    skipped = 0
+    # remove repeated header rows inside the file
+    if "DIN" in df.columns:
+        df = df[df["DIN"].astype(str).str.upper() != "DIN"]
+
+    # remove empty junk columns
+    drop_cols = [c for c in df.columns if c.lower().startswith("unnamed")]
+    if drop_cols:
+        df = df.drop(columns=drop_cols, errors="ignore")
+
+    needed = ["Produit", "Format", "Nombre de services", "Qté servie"]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"Missing required columns: {missing}")
+
+    return df
+
+
+def aggregate_inventory(df: pd.DataFrame) -> pd.DataFrame:
+    df = normalise_inventory_dataframe(df)
+
+    totals = defaultdict(float)
+    prefixes = defaultdict(set)
+    units = defaultdict(list)
+    examples = {}
 
     for _, row in df.iterrows():
-        qty = to_float_or_none(row.iloc[qty_idx])
-        if qty is None:
-            skipped += 1
+        product = norm(row["Produit"])
+        fmt = norm(row.get("Format", ""))
+
+        if not product:
             continue
 
-        full_desc = build_description(row, text_cols)
-        if not full_desc:
-            skipped += 1
+        prefix, _ = strip_prefix(product)
+        med_key = extract_medication_key(product)
+
+        if not med_key:
             continue
 
-        cleaned_desc, found_vendors = remove_vendors_and_manufacturer(full_desc, vendors)
-        found_prefix, desc_no_prefix = strip_generic_prefix(cleaned_desc, prefixes)
-        molecule = extract_molecule(desc_no_prefix)
+        # Core counting logic:
+        # total stock = number of services * quantity served
+        n_services = to_float_or_zero(row.get("Nombre de services", 0))
+        qty_served = to_float_or_zero(row.get("Qté servie", 0))
 
-        if not molecule:
-            skipped += 1
+        total_units = n_services * qty_served
+
+        if total_units <= 0:
             continue
 
-        probable_unit = detect_probable_unit(desc_no_prefix)
+        totals[med_key] += total_units
 
-        totals[molecule] += float(qty)
-        unit_labels[molecule].append(probable_unit)
+        if prefix:
+            prefixes[med_key].add(prefix)
 
-        if molecule not in sample_desc:
-            sample_desc[molecule] = desc_no_prefix
-        if found_prefix:
-            prefix_seen[molecule].add(found_prefix)
-        if found_vendors:
-            vendor_seen[molecule].update(found_vendors)
+        units[med_key].append(detect_probable_unit(product, fmt))
 
-        parsed += 1
+        if med_key not in examples:
+            examples[med_key] = product
 
     rows = []
-    for molecule in sorted(totals.keys()):
-        unit_counter = Counter(unit_labels[molecule])
-        most_common_unit = unit_counter.most_common(1)[0][0] if unit_counter else "units"
+    for med in sorted(totals.keys()):
+        unit = max(set(units[med]), key=units[med].count) if units[med] else "units"
+        rows.append({
+            "Médicament": med,
+            "Quantité totale": totals[med],
+            "Unité probable": unit,
+            "Exemple": examples.get(med, ""),
+            "Préfixes ignorés trouvés": ", ".join(sorted(prefixes.get(med, set()))),
+        })
 
-        rows.append(
-            {
-                "Molécule": molecule,
-                "Quantité totale en stock": totals[molecule],
-                "Unité probable": most_common_unit,
-                "Exemple description": sample_desc.get(molecule, ""),
-                "Préfixes trouvés": ", ".join(sorted(prefix_seen.get(molecule, set()))),
-                "Vendeurs trouvés": ", ".join(sorted(vendor_seen.get(molecule, set()))),
-            }
-        )
-
-    out = pd.DataFrame(rows)
-    return out, parsed, skipped
+    return pd.DataFrame(rows)
 
 
 # -----------------------------
@@ -418,21 +335,20 @@ def dataframe_to_pdf(df: pd.DataFrame, title: str) -> bytes:
 
     x = 0.6 * inch
     y = height - 0.7 * inch
+    line_h = 10
 
     c.setFont("Helvetica-Bold", 14)
     c.drawString(x, y, title)
     y -= 0.35 * inch
 
     c.setFont("Helvetica", 8)
-    line_h = 10
-
-    c.drawString(x, y, f"{'Molécule':20} {'Quantité':>12}  {'Unité':14}")
+    c.drawString(x, y, f"{'Médicament':28} {'Quantité':>12}  {'Unité':12}")
     y -= line_h
-    c.drawString(x, y, "-" * 60)
+    c.drawString(x, y, "-" * 70)
     y -= line_h
 
     for _, row in df.iterrows():
-        line = f"{str(row['Molécule'])[:20]:20} {float(row['Quantité totale en stock']):>12.2f}  {str(row['Unité probable'])[:14]}"
+        line = f"{str(row['Médicament'])[:28]:28} {float(row['Quantité totale']):>12.2f}  {str(row['Unité probable'])[:12]}"
         if y < 0.75 * inch:
             c.showPage()
             y = height - 0.7 * inch
@@ -447,9 +363,9 @@ def dataframe_to_pdf(df: pd.DataFrame, title: str) -> bytes:
 # -----------------------------
 # Streamlit UI
 # -----------------------------
-st.set_page_config(page_title="Inventaire par molécule", layout="wide")
-st.title("Inventaire par molécule")
-st.write("Choisis la vraie colonne de quantité en stock. That is the whole game.")
+st.set_page_config(page_title="Inventaire regroupé", layout="wide")
+st.title("Inventaire regroupé")
+st.write("Upload le fichier. L’app regroupe automatiquement les médicaments en ignorant les prefixes comme APO / PMS / AURO / JAMP / AA.")
 
 uploaded = st.file_uploader(
     "Upload inventory file (CSV / Excel / PDF)",
@@ -457,24 +373,6 @@ uploaded = st.file_uploader(
 )
 
 with st.sidebar:
-    st.header("Vendeurs à retirer du nom")
-    vendors_text = st.text_area(
-        "Une entrée par ligne",
-        value="\n".join(DEFAULT_VENDORS),
-        height=120
-    )
-    vendors = [norm(v) for v in vendors_text.splitlines() if norm(v)]
-
-    st.divider()
-    st.header("Préfixes génériques à ignorer")
-    prefixes_text = st.text_area(
-        "Une entrée par ligne",
-        value="\n".join(DEFAULT_PREFIXES),
-        height=220
-    )
-    prefixes = {norm(p).upper() for p in prefixes_text.splitlines() if norm(p)}
-
-    st.divider()
     show_debug = st.checkbox("Afficher colonnes debug", value=False)
     export_pdf = st.checkbox("Générer aussi un PDF", value=False)
 
@@ -489,74 +387,44 @@ except Exception as e:
     st.stop()
 
 st.success(note)
-st.subheader("Preview")
-st.dataframe(df_raw.head(40), use_container_width=True)
 
-# Manual quantity selection
-st.subheader("1) Choisis la colonne de quantité")
-qty_guesses = guess_quantity_columns(df_raw)
-guess_text = ", ".join([f"Col {i} ({score:.2f})" for score, i in qty_guesses[:6]])
-st.caption(f"Possible numeric columns: {guess_text}")
-
-qty_idx = st.selectbox(
-    "Select the column that contains stock quantity",
-    options=list(range(df_raw.shape[1])),
-    index=qty_guesses[0][1] if qty_guesses else 0,
-    format_func=lambda x: f"Column {x}"
-)
-
-# Text columns selection
-st.subheader("2) Colonnes de description")
-suggested_text_cols = guess_text_columns(df_raw, qty_idx)
-
-text_cols = st.multiselect(
-    "Select the columns that together describe the medication",
-    options=list(range(df_raw.shape[1])),
-    default=suggested_text_cols,
-    format_func=lambda x: f"Column {x}"
-)
-
-if not text_cols:
-    st.warning("Pick at least one description column.")
+try:
+    result = aggregate_inventory(df_raw)
+except Exception as e:
+    st.error(f"Failed to process inventory: {e}")
     st.stop()
 
-out, parsed, skipped = aggregate_inventory(
-    df_raw,
-    qty_idx=qty_idx,
-    text_cols=text_cols,
-    vendors=vendors,
-    prefixes=prefixes,
-)
+if result.empty:
+    st.warning("No medication quantities could be calculated from this file.")
+    st.stop()
 
-st.write(f"Parsed rows: **{parsed}** — Skipped rows: **{skipped}**")
-
-display_df = out.copy()
-if not show_debug and not display_df.empty:
-    display_df = display_df[["Molécule", "Quantité totale en stock", "Unité probable"]]
+display_df = result.copy()
+if not show_debug:
+    display_df = display_df[["Médicament", "Quantité totale", "Unité probable"]]
 
 st.subheader("Résultat")
 st.dataframe(display_df, use_container_width=True)
 
-# Excel download
+# Excel output
 excel_buf = io.BytesIO()
 with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
-    out.to_excel(writer, index=False, sheet_name="Inventaire_par_molecule")
+    result.to_excel(writer, index=False, sheet_name="Inventaire_regroupe")
 
 st.download_button(
     "Télécharger Excel (.xlsx)",
     data=excel_buf.getvalue(),
-    file_name="inventaire_par_molecule.xlsx",
+    file_name="inventaire_regroupe.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
 
-# Optional PDF download
+# Optional PDF output
 if export_pdf:
     try:
-        pdf_bytes = dataframe_to_pdf(display_df, "Inventaire par molécule")
+        pdf_bytes = dataframe_to_pdf(display_df, "Inventaire regroupé")
         st.download_button(
             "Télécharger PDF (.pdf)",
             data=pdf_bytes,
-            file_name="inventaire_par_molecule.pdf",
+            file_name="inventaire_regroupe.pdf",
             mime="application/pdf",
         )
     except Exception as e:
