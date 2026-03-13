@@ -18,7 +18,7 @@
 
 import io
 import re
-from collections import defaultdict
+from collections import defaultdict, Counter
 from typing import List, Optional, Tuple, Dict, Set
 
 import pandas as pd
