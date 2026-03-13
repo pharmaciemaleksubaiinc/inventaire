@@ -1,5 +1,6 @@
 # inventaire.py
 # Upload inventory -> auto-group by medication -> ignore prefixes -> total stock units
+# Keeps dosage/strength in the medication name.
 #
 # Install:
 #   pip install streamlit pandas openpyxl pdfplumber pdfminer.six
@@ -44,9 +45,8 @@ IGNORED_PREFIXES = {
     "ACC", "ACH", "AG", "BGP"
 }
 
-# Tokens that usually mean "stop medication name here"
+# Tokens that mean packaging / form and should usually stop the name
 STOP_TOKENS = {
-    "MG", "MCG", "G", "KG", "ML", "L", "IU", "%",
     "TAB", "TABS", "TABLET", "TABLETS",
     "CAP", "CAPS", "CAPSULE", "CAPSULES",
     "COMP", "COMPRIME", "COMPRIMES", "COMPRIMÉ", "COMPRIMÉS",
@@ -54,7 +54,49 @@ STOP_TOKENS = {
     "INH", "INHALATEUR", "SPRAY", "POUDRE", "SUSP", "SUSPENSION",
     "SOLUTION", "SYRUP", "SIROP", "GEL", "CREME", "CRÈME",
     "XR", "SR", "ER", "CR", "DR", "CD",
-    "PLAQUETTE", "ENTERIC", "ENT", "ENT."
+    "PLAQUETTE", "ENTERIC", "ENT", "ENT.",
+    "POMPE", "PUMP", "BOUTEILLE", "BOTTLE", "BOTTLES",
+    "VIAL", "VIALS", "AMP", "AMPOULE", "PATCH", "PATCHES",
+    "STYLO", "PEN", "PENS"
+}
+
+UNIT_WORDS = {
+    "TAB": "pills",
+    "TABS": "pills",
+    "TABLET": "pills",
+    "TABLETS": "pills",
+    "COMP": "pills",
+    "COMPRIME": "pills",
+    "COMPRIMES": "pills",
+    "COMPRIMÉ": "pills",
+    "COMPRIMÉS": "pills",
+
+    "CAP": "capsules",
+    "CAPS": "capsules",
+    "CAPSULE": "capsules",
+    "CAPSULES": "capsules",
+
+    "BOTTLE": "bottles",
+    "BOTTLES": "bottles",
+    "VIAL": "vials",
+    "VIALS": "vials",
+    "BOX": "boxes",
+    "BOXES": "boxes",
+    "PACK": "packs",
+    "PACKS": "packs",
+    "PEN": "pens",
+    "PENS": "pens",
+    "STYLO": "pens",
+
+    "ML": "mL",
+    "L": "L",
+    "DOSE": "doses",
+    "DOSES": "doses",
+}
+
+# Single-word starts that should keep the next token too
+KEEP_SECOND_TOKEN = {
+    "VITAMINE", "ACIDE"
 }
 
 
@@ -88,18 +130,14 @@ def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
 # Read files
 # -----------------------------
 def read_csv_inventory(uploaded_file) -> pd.DataFrame:
-    # Your CSV export has the real header on row 2 (skip first row)
     df = pd.read_csv(uploaded_file, skiprows=1)
-    df = clean_columns(df)
-    return df
+    return clean_columns(df)
 
 
 def read_excel_inventory(uploaded_file) -> pd.DataFrame:
-    # Try normal read first
     df = pd.read_excel(uploaded_file)
     df = clean_columns(df)
 
-    # If headers are bad, retry like the CSV structure
     if "Produit" not in df.columns and "Qté servie" not in df.columns:
         df = pd.read_excel(uploaded_file, skiprows=1)
         df = clean_columns(df)
@@ -130,7 +168,6 @@ def read_pdf_inventory(uploaded_file) -> pd.DataFrame:
     rows = [r + [None] * (max_cols - len(r)) for r in rows]
     raw = pd.DataFrame(rows)
 
-    # Try to use first real row as header if it contains Produit / Qté servie
     header_row_idx = None
     for i in range(min(10, len(raw))):
         joined = " | ".join([norm(x).replace("\n", " ") for x in raw.iloc[i].fillna("").tolist()])
@@ -144,9 +181,7 @@ def read_pdf_inventory(uploaded_file) -> pd.DataFrame:
     header = [norm(x).replace("\n", " ") for x in raw.iloc[header_row_idx].tolist()]
     df = raw.iloc[header_row_idx + 1:].copy()
     df.columns = header
-    df = clean_columns(df)
-
-    return df
+    return clean_columns(df)
 
 
 def read_uploaded_file(uploaded_file) -> Tuple[pd.DataFrame, str]:
@@ -154,10 +189,8 @@ def read_uploaded_file(uploaded_file) -> Tuple[pd.DataFrame, str]:
 
     if name.endswith(".csv"):
         return read_csv_inventory(uploaded_file), "Loaded CSV"
-
     if name.endswith(".xlsx") or name.endswith(".xls"):
         return read_excel_inventory(uploaded_file), "Loaded Excel"
-
     if name.endswith(".pdf"):
         return read_pdf_inventory(uploaded_file), "Loaded PDF"
 
@@ -170,15 +203,14 @@ def read_uploaded_file(uploaded_file) -> Tuple[pd.DataFrame, str]:
 def strip_prefix(product_name: str) -> Tuple[Optional[str], str]:
     """
     Examples:
-      APO FLUOXETINE 20MG COMPRIME -> FLUOXETINE ...
-      APO-FLUOXETINE 20MG -> FLUOXETINE ...
-      AA LEVOCARB CR 200+50MG -> LEVOCARB ...
+      APO FLUOXETINE 20MG COMPRIME -> FLUOXETINE 20MG COMPRIME
+      APO-FLUOXETINE 20MG -> FLUOXETINE 20MG
+      AA LEVOCARB CR 200+50MG -> LEVOCARB CR 200+50MG
     """
     s = norm(product_name).upper().replace("\n", " ")
     if not s:
         return None, s
 
-    # hyphen form
     m = re.match(r"^([A-Z]{1,15})\s*-\s*(.+)$", s)
     if m:
         prefix = m.group(1).upper()
@@ -186,7 +218,6 @@ def strip_prefix(product_name: str) -> Tuple[Optional[str], str]:
         if prefix in IGNORED_PREFIXES:
             return prefix, rest
 
-    # space form
     parts = s.split()
     if len(parts) >= 2:
         first = parts[0].upper()
@@ -196,34 +227,118 @@ def strip_prefix(product_name: str) -> Tuple[Optional[str], str]:
     return None, s
 
 
+def is_strength_token(tok: str) -> bool:
+    """
+    Accept dosage/strength tokens in the medication name.
+    Examples:
+      20MG
+      1000
+      IU
+      0.5%
+      200+50MG
+      5/325MG
+      10MCG
+    """
+    tok = tok.upper().strip()
+
+    if not tok:
+        return False
+
+    # plain numbers that might belong to dosage
+    if re.fullmatch(r"\d+(?:[.,]\d+)?", tok):
+        return True
+
+    # IU / % / MG / MCG / G / ML / L forms
+    if re.fullmatch(r"\d+(?:[.,]\d+)?(?:MG|MCG|G|KG|ML|L|IU|U|%)", tok):
+        return True
+
+    # combo strengths
+    if re.fullmatch(r"\d+(?:[.,]\d+)?[+/]\d+(?:[.,]\d+)?(?:MG|MCG|G|ML|IU|%)?", tok):
+        return True
+
+    # fraction strengths
+    if re.fullmatch(r"\d+(?:[.,]\d+)?/\d+(?:[.,]\d+)?(?:MG|MCG|G|ML|IU|%)?", tok):
+        return True
+
+    # standalone unit after number token
+    if tok in {"MG", "MCG", "G", "KG", "ML", "L", "IU", "U", "%"}:
+        return True
+
+    return False
+
+
 def extract_medication_key(product_name: str) -> str:
     """
-    Goal: get a clean medication grouping key from Produit.
-    We stop once we hit dosage/form/package words.
+    Keep the medication name + useful strength/dosage.
+    Examples:
+      APO FLUOXETINE 20MG CAP -> FLUOXETINE 20MG
+      VITAMINE D 1000 IU TAB -> VITAMINE D 1000 IU
+      M LATANOPROST-TIMOLOL 0.005%-0.5% -> LATANOPROST-TIMOLOL 0.005%-0.5%
     """
     _, cleaned = strip_prefix(product_name)
-    cleaned = norm(cleaned)
+    cleaned = norm(cleaned).upper()
 
+    words = cleaned.split()
     tokens = []
-    for raw_tok in cleaned.split():
-        tok = raw_tok.strip(" ,;()[]{}:+-/").upper()
+    saw_name = False
+
+    i = 0
+    while i < len(words):
+        raw_tok = words[i]
+        tok = raw_tok.strip(" ,;()[]{}")
 
         if not tok:
+            i += 1
             continue
 
-        # stop at anything dosage-like or format-like
-        if tok in STOP_TOKENS:
-            break
-        if re.search(r"\d", tok):
+        # ignore lonely junk tokens before the real name
+        if not saw_name and len(tok.strip("+-/")) <= 1:
+            i += 1
+            continue
+
+        # stop at package/form tokens
+        if tok.upper() in STOP_TOKENS:
             break
 
-        tokens.append(tok)
+        # if we haven't started yet, we need a real word
+        if not saw_name:
+            if re.search(r"[A-Z]", tok):
+                tokens.append(tok.upper())
+                saw_name = True
 
-    # fallback: if nothing survived, use first alphabetic token after prefix stripping
+                # special cases like VITAMINE D / ACIDE FOLIQUE
+                if tok.upper() in KEEP_SECOND_TOKEN and i + 1 < len(words):
+                    nxt = words[i + 1].strip(" ,;()[]{}").upper()
+                    if nxt and nxt not in STOP_TOKENS and len(nxt) > 1:
+                        tokens.append(nxt)
+                        i += 1
+            i += 1
+            continue
+
+        # after name started, keep strength tokens too
+        if is_strength_token(tok):
+            tokens.append(tok.upper())
+            i += 1
+            continue
+
+        # if it's another normal word after the first name, keep it only if
+        # it still looks like part of the med name and not form/packaging junk
+        if re.search(r"[A-Z]", tok) and tok.upper() not in STOP_TOKENS:
+            # avoid meaningless one-letter junk
+            if len(tok.strip("+-/")) > 1:
+                # allow chemical-family style continuations
+                if len(tokens) < 3 and not any(is_strength_token(t) for t in tokens):
+                    tokens.append(tok.upper())
+                    i += 1
+                    continue
+
+        break
+
+    # fallback if parsing was too aggressive
     if not tokens:
-        for raw_tok in cleaned.split():
-            tok = raw_tok.strip(" ,;()[]{}:+-/").upper()
-            if tok and re.search(r"[A-Z]", tok) and tok not in STOP_TOKENS:
+        for raw_tok in words:
+            tok = raw_tok.strip(" ,;()[]{}").upper()
+            if tok and len(tok) > 1 and re.search(r"[A-Z]", tok):
                 return tok
         return ""
 
@@ -250,11 +365,9 @@ def detect_probable_unit(product_name: str, format_value: str) -> str:
 def normalise_inventory_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # remove repeated header rows inside the file
     if "DIN" in df.columns:
         df = df[df["DIN"].astype(str).str.upper() != "DIN"]
 
-    # remove empty junk columns
     drop_cols = [c for c in df.columns if c.lower().startswith("unnamed")]
     if drop_cols:
         df = df.drop(columns=drop_cols, errors="ignore")
@@ -285,14 +398,11 @@ def aggregate_inventory(df: pd.DataFrame) -> pd.DataFrame:
         prefix, _ = strip_prefix(product)
         med_key = extract_medication_key(product)
 
-        if not med_key:
+        if not med_key or len(med_key) <= 1:
             continue
 
-        # Core counting logic:
-        # total stock = number of services * quantity served
         n_services = to_float_or_zero(row.get("Nombre de services", 0))
         qty_served = to_float_or_zero(row.get("Qté servie", 0))
-
         total_units = n_services * qty_served
 
         if total_units <= 0:
@@ -342,13 +452,13 @@ def dataframe_to_pdf(df: pd.DataFrame, title: str) -> bytes:
     y -= 0.35 * inch
 
     c.setFont("Helvetica", 8)
-    c.drawString(x, y, f"{'Médicament':28} {'Quantité':>12}  {'Unité':12}")
+    c.drawString(x, y, f"{'Médicament':34} {'Quantité':>12}  {'Unité':12}")
     y -= line_h
-    c.drawString(x, y, "-" * 70)
+    c.drawString(x, y, "-" * 78)
     y -= line_h
 
     for _, row in df.iterrows():
-        line = f"{str(row['Médicament'])[:28]:28} {float(row['Quantité totale']):>12.2f}  {str(row['Unité probable'])[:12]}"
+        line = f"{str(row['Médicament'])[:34]:34} {float(row['Quantité totale']):>12.2f}  {str(row['Unité probable'])[:12]}"
         if y < 0.75 * inch:
             c.showPage()
             y = height - 0.7 * inch
@@ -365,7 +475,7 @@ def dataframe_to_pdf(df: pd.DataFrame, title: str) -> bytes:
 # -----------------------------
 st.set_page_config(page_title="Inventaire regroupé", layout="wide")
 st.title("Inventaire regroupé")
-st.write("Upload le fichier. L’app regroupe automatiquement les médicaments en ignorant les prefixes comme APO / PMS / AURO / JAMP / AA.")
+st.write("Upload le fichier. L’app regroupe automatiquement les médicaments en ignorant les prefixes comme APO / PMS / AURO / JAMP / AA, tout en gardant le dosage utile dans le nom.")
 
 uploaded = st.file_uploader(
     "Upload inventory file (CSV / Excel / PDF)",
